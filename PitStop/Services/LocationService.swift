@@ -10,6 +10,8 @@ import Observation
 final class LocationService: NSObject {
     private(set) var authorization: CLAuthorizationStatus
     private(set) var lastRealLocation: CLLocation?
+    /// Compass heading in degrees from true north (nil until the compass reports).
+    private(set) var heading: Double?
 
     /// Called on the main actor for every real GPS fix.
     @ObservationIgnored var onLocation: ((CLLocation) -> Void)?
@@ -22,6 +24,7 @@ final class LocationService: NSObject {
         manager.desiredAccuracy = kCLLocationAccuracyBest
         manager.activityType = .fitness
         manager.distanceFilter = 2
+        manager.headingFilter = 5
     }
 
     var isAuthorized: Bool {
@@ -36,6 +39,7 @@ final class LocationService: NSObject {
     func start() {
         guard isAuthorized else { return }
         manager.startUpdatingLocation()
+        if CLLocationManager.headingAvailable() { manager.startUpdatingHeading() }
     }
 
     /// Keep GPS alive in the background during a run (needs the "Location updates" background mode).
@@ -64,6 +68,12 @@ extension LocationService: CLLocationManagerDelegate {
                 self.onLocation?(location)
             }
         }
+    }
+
+    nonisolated func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
+        guard newHeading.headingAccuracy >= 0 else { return }
+        let degrees = newHeading.trueHeading >= 0 ? newHeading.trueHeading : newHeading.magneticHeading
+        Task { @MainActor in self.heading = degrees }
     }
 
     nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: any Error) {

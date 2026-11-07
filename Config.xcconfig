@@ -1,0 +1,9 @@
+// Config.xcconfig: base build configuration for Debug and Release (committed).
+//
+// `#include?` (with the question mark) is an OPTIONAL include: if Secrets.xcconfig is missing
+// (a fresh clone, a teammate's machine), the build still succeeds and the app simply runs
+// without a Gemini key, using its non-AI fallbacks.
+GEMINI_API_KEY =
+AI_PROXY_HOST =
+AI_PROXY_TOKEN =
+#include? "Secrets.xcconfig"

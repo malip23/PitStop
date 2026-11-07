@@ -4,9 +4,16 @@
 <dict>
 	<key>CFBundleDisplayName</key>
 	<string>PitStop</string>
+	<key>GEMINI_API_KEY</key>
+	<string>$(GEMINI_API_KEY)</string>
+	<key>AI_PROXY_HOST</key>
+	<string>$(AI_PROXY_HOST)</string>
+	<key>AI_PROXY_TOKEN</key>
+	<string>$(AI_PROXY_TOKEN)</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>location</string>
+		<string>audio</string>
 	</array>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>PitStop uses your location to track your run, show nearby partner businesses, and route you to Off-Peak Quests.</string>

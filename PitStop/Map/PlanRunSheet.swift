@@ -7,6 +7,7 @@ struct PlanRunSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var plan = RunPlan()
     @State private var didLoad = false
+    @State private var showResults = false
 
     var body: some View {
         NavigationStack {
@@ -19,7 +20,10 @@ struct PlanRunSheet: View {
                 }
                 .padding()
             }
-            .safeAreaInset(edge: .bottom) { startButton }
+            .safeAreaInset(edge: .bottom) { actionButtons }
+            .navigationDestination(isPresented: $showResults) {
+                DestinationListView(plan: plan) { dismiss() }
+            }
             .navigationTitle("Plan your \(plan.activity.displayName.lowercased())")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -30,7 +34,7 @@ struct PlanRunSheet: View {
             .onAppear {
                 guard !didLoad else { return }
                 didLoad = true
-                plan = app.planStore.lastPlan
+                plan = app.pendingPlan ?? app.planStore.lastPlan
             }
             .sensoryFeedback(.selection, trigger: plan.activity)
             .sensoryFeedback(.selection, trigger: plan.shape)
@@ -140,21 +144,30 @@ struct PlanRunSheet: View {
         .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
 
-    private var startButton: some View {
-        Button {
-            app.startRun(with: plan)
-            dismiss()
-        } label: {
-            Label("Start \(plan.activity.displayName)", systemImage: "play.fill")
-                .font(.headline)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 6)
+    private var actionButtons: some View {
+        VStack(spacing: 8) {
+            Button {
+                app.findDestinations(for: plan)
+                showResults = true
+            } label: {
+                Label(plan.surpriseMe ? "Surprise me" : "Find destinations",
+                      systemImage: plan.surpriseMe ? "dice.fill" : "mappin.and.ellipse")
+                    .font(.headline)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 6)
+            }
+            .buttonStyle(.borderedProminent)
+
+            Button("Start without a destination") {
+                app.startRun(with: plan)
+                dismiss()
+            }
+            .font(.subheadline.weight(.medium))
         }
-        .buttonStyle(.borderedProminent)
         .controlSize(.large)
         .padding()
         .background(.bar)
-        .disabled(!app.location.isAuthorized)
+        .disabled(!app.location.isAuthorized || app.currentLocation == nil)
     }
 
     // MARK: Derived values

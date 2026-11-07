@@ -21,7 +21,10 @@ struct DestinationCard: View {
                     Text(subtitle).font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 0)
-                CloseButton { app.clearDestination() }
+                CloseButton {
+                    app.clearDestination()
+                    app.cancelPlan()
+                }
             }
         }
     }

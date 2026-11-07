@@ -34,7 +34,9 @@
           ],
         },
       ],
-    }, {
+    },
+    { "path": "Config.xcconfig", "target-membership": [ "PitStop/resources" ] },
+    {
       "kind": "group",
       "name": "Products",
       "children": [
@@ -48,6 +50,10 @@
       "id": "25CD3E59309FA49800016D6E",
       "product": "Products/PitStop.app",
       "product-type": "application",
+      "specialized-configurations": [
+        { "name": "Debug", "file": "Config.xcconfig" },
+        { "name": "Release", "file": "Config.xcconfig" },
+      ],
       "build-phases": [
         "compile-sources",
         "frameworks",

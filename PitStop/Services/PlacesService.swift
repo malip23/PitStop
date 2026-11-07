@@ -92,7 +92,7 @@ final class PlacesService {
         let tasks = searches.map { search, category in
             Task { () -> [RealPlace]? in
                 guard let response = try? await search.start() else { return nil }
-                return response.mapItems.compactMap { Self.makePlace(from: $0, category: category) }
+                return response.mapItems.compactMap { RealPlace(mapItem: $0, category: category) }
             }
         }
         var batches: [[RealPlace]] = []
@@ -125,25 +125,6 @@ final class PlacesService {
             group.sorted { $0.location.distance(from: location) < $1.location.distance(from: location) }
                 .prefix(limit)
         }
-    }
-
-    private static func makePlace(from item: MKMapItem, category: BusinessCategory) -> RealPlace? {
-        guard let name = item.name, !name.isEmpty else { return nil }
-        let placemark = item.placemark
-        let coordinate = placemark.coordinate
-
-        // Stable id: MapKit's own identifier when available, otherwise name + rounded coordinate.
-        var id = "\(name)|\(String(format: "%.5f,%.5f", coordinate.latitude, coordinate.longitude))"
-        if #available(iOS 18.0, *), let identifier = item.identifier {
-            id = identifier.rawValue
-        }
-
-        let street = [placemark.subThoroughfare, placemark.thoroughfare].compactMap { $0 }.joined(separator: " ")
-        let address = [street, placemark.locality ?? ""].filter { !$0.isEmpty }.joined(separator: ", ")
-
-        return RealPlace(id: id, name: name, category: category,
-                         address: address.isEmpty ? nil : address,
-                         latitude: coordinate.latitude, longitude: coordinate.longitude)
     }
 
     // MARK: Disk cache (Caches/nearby-places.json)

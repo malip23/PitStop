@@ -32,11 +32,47 @@ struct RunStatsCard: View {
                 }
 
                 goalProgress
+                checkInProgress
+                finishedVerdict
 
                 controls
             }
         }
         .animation(.snappy, value: run.state)
+    }
+
+    /// "Checking in…" ring while the runner waits the 10 seconds at the destination.
+    @ViewBuilder private var checkInProgress: some View {
+        if app.checkIn.enteredAt != nil, !app.checkIn.isCheckedIn {
+            TimelineView(.periodic(from: .now, by: 0.5)) { _ in
+                HStack(spacing: 10) {
+                    ProgressView(value: app.checkIn.dwellProgress)
+                        .progressViewStyle(.circular)
+                        .tint(Theme.lime)
+                    Text("Checking in at \(app.checkIn.target?.name ?? "destination"). Stay here…")
+                        .font(.subheadline.weight(.semibold))
+                }
+            }
+        } else if app.checkIn.isCheckedIn {
+            Label("Checked in at \(app.checkIn.target?.name ?? "destination")", systemImage: "checkmark.circle.fill")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(Theme.lime)
+        }
+    }
+
+    /// After the run: the anti-cheat verdict.
+    @ViewBuilder private var finishedVerdict: some View {
+        if app.run.state == .finished, let record = app.lastFinishedRun {
+            VStack(alignment: .leading, spacing: 4) {
+                Label(record.verification.passed ? "Verified run" : "Not verified",
+                      systemImage: record.verification.passed ? "checkmark.shield.fill" : "xmark.shield.fill")
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(record.verification.passed ? Theme.lime : .red)
+                ForEach(record.verification.reasons, id: \.self) {
+                    Text("• \($0)").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
     }
 
     /// Progress bar toward the plan's goal distance ("1.2 of 3.0 mi").
@@ -76,13 +112,31 @@ struct RunStatsCard: View {
     @ViewBuilder private var controls: some View {
         switch app.run.state {
         case .idle:
-            Button(action: onPlan) {
-                Label("Plan Run", systemImage: "figure.run").frame(maxWidth: .infinity)
+            if app.pendingPlan != nil || app.destination != nil {
+                let plan = app.planForRouting
+                // A plan (and usually a destination) is picked: ready to go.
+                HStack(spacing: 12) {
+                    Button(action: onPlan) {
+                        Label("Edit plan", systemImage: "slider.horizontal.3").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    Button { app.startPlannedRun() } label: {
+                        Label("Start \(plan.activity.displayName)", systemImage: "play.fill").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+                .controlSize(.large)
+                .disabled(!app.location.isAuthorized)
+                .sensoryFeedback(.start, trigger: app.run.state)
+            } else {
+                Button(action: onPlan) {
+                    Label("Plan Run", systemImage: "figure.run").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .disabled(!app.location.isAuthorized)
+                .sensoryFeedback(.start, trigger: app.run.state)
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
-            .disabled(!app.location.isAuthorized)
-            .sensoryFeedback(.start, trigger: app.run.state)
 
         case .running, .paused:
             HStack(spacing: 12) {

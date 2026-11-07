@@ -1,0 +1,9 @@
+# PitStop Gemini proxy: a Cloudflare Worker that keeps the Gemini API key off the phone.
+# Deploy steps: proxy/README.md
+name = "pitstop-gemini-proxy"
+main = "src/index.js"
+compatibility_date = "2025-09-01"
+
+# Secrets are NOT stored here. Set them with:
+#   npx wrangler secret put GEMINI_API_KEY
+#   npx wrangler secret put APP_TOKEN

@@ -40,8 +40,11 @@ struct RealPlaceDetailCard: View {
                     CloseButton(action: onClose)
                 }
                 // Real places can be a run destination, just never a reward.
-                DestinationButton(isCurrent: app.destination?.id == place.id) {
-                    app.setDestination(PlannedDestination(place: place))
+                HStack(spacing: 8) {
+                    DestinationButton(isCurrent: app.destination?.id == place.id) {
+                        app.setDestination(PlannedDestination(place: place))
+                    }
+                    SaveForLaterButton(destination: PlannedDestination(place: place))
                 }
             }
         }

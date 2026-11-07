@@ -7,8 +7,11 @@ import Observation
 ///
 ///     LocationService (real GPS) ─┐
 ///                                 ├─► AppState.handleLocation ─► RunTracker
-///     DemoRunSimulator (fake) ────┘                           ├► PlacesService (refresh nearby places)
+///     DemoRunSimulator (fake) ────┘                           ├► NavigationEngine (turn-by-turn)
+///                                                             ├► PlacesService (refresh nearby places)
 ///                                                             └► evaluateOffers (quest banner)
+///
+/// While Demo Mode is playing, real GPS fixes are ignored so the two never mix.
 ///
 /// Two kinds of businesses appear on the map:
 /// - `partners`: businesses on PitStop. Only these can offer rewards, create quests, or be routed to.
@@ -21,16 +24,65 @@ final class AppState {
     let businessStore = BusinessStore()
     let questStore = QuestStore()
     let planStore = RunPlanStore()
+    let finder = DestinationFinder()
+    let routeGenerator = RouteGenerator()
+    let navigation = NavigationEngine()
+    let developer = DeveloperSettings()
+    let demo = DemoRunSimulator()
+    let preferences = AppPreferences()
+    let crossings = CrossingAlertEngine()
+    let history = HistoryStore()
+    let motion = MotionService()
+    let antiCheat = AntiCheatEngine()
+    let checkIn = CheckInMonitor()
+    /// AI provider. Features talk to it through the `AIService` protocol, so it can be swapped.
+    let ai = GeminiService()
 
     /// The location the app is using right now: real GPS, or simulated in Demo Mode.
     private(set) var currentLocation: CLLocation?
 
     /// The plan for the current run (nil = free run, or no run).
     private(set) var activePlan: RunPlan?
+    /// A plan chosen on the sheet whose run hasn't started yet (destinations being picked).
+    private(set) var pendingPlan: RunPlan?
     /// Where the current run is headed, if anywhere.
     private(set) var destination: PlannedDestination?
     /// Short note on how the destination was chosen (e.g. "Surprise pick").
     private(set) var destinationNote: String?
+
+    /// Route options for the current destination (shown before the run starts).
+    private(set) var routeOptions: [RouteOption] = []
+    var selectedRouteID: RouteOption.ID?
+    private(set) var isGeneratingRoutes = false
+    /// The AI route agent's pick (shown as the "AI suggested" card), its progress, and any failure.
+    private(set) var aiSuggestion: RouteAgent.Suggestion?
+    private(set) var aiPlanningStep: String?
+    private(set) var aiRouteError: AIError?
+    /// Card vs. chips: "Show other options" switches to the chips.
+    var showAISuggestion = true
+    @ObservationIgnored private var aiTask: Task<Void, Never>?
+
+    /// Where the run started (the finish line for out-and-back reroutes).
+    @ObservationIgnored private var runStart: CLLocationCoordinate2D?
+    @ObservationIgnored private var routeTask: Task<Void, Never>?
+    private(set) var isRerouting = false
+
+    /// IDs (business or real place) the AI recommender picked. Filled in by AI §5.
+    var recommendedIDs: Set<String> = []
+    /// IDs of places the user has run to and checked in at (from run history).
+    var visitedIDs: Set<String> { history.visitedIDs }
+
+    /// Shown as the celebration card after a check-in.
+    var celebration: CheckInEvent?
+    /// Badges unlocked by the run that just ended (celebrated after the check-in card).
+    var badgeCelebration: [BadgeKind] = []
+    /// The run that just ended (the finished card shows its verification).
+    private(set) var lastFinishedRun: RunRecord?
+    /// Developer "fake run at car speed": playback at 30 mph with no steps, to show anti-cheat rejecting it.
+    private(set) var isFakeCarRun = false
+    @ObservationIgnored private var runID = UUID().uuidString
+    @ObservationIgnored private var runQuestID: Quest.ID?
+    @ObservationIgnored private var checkedInDestination: PlannedDestination?
 
     /// The offer currently shown in the in-app banner.
     private(set) var bannerOffer: QuestOffer?
@@ -42,7 +94,20 @@ final class AppState {
 
     init() {
         location.onLocation = { [weak self] fix in
+            guard let self else { return }
+            // Demo playback owns the location while it runs.
+            if self.demo.isPlaying { return }
+            self.handleLocation(fix)
+        }
+        demo.onLocation = { [weak self] fix in
             self?.handleLocation(fix)
+        }
+        checkIn.onCheckIn = { [weak self] destination in
+            self?.handleCheckIn(at: destination)
+        }
+        crossings.onAlert = { [weak self] point in
+            guard let self, self.preferences.voiceCues else { return }
+            SpeechService.shared.speak(oneOf: point.kind.voiceCues, key: "crossing.\(point.kind.rawValue)")
         }
     }
 
@@ -53,6 +118,14 @@ final class AppState {
         currentLocation = fix
         places.refreshIfNeeded(around: fix)
         run.ingest(fix)
+        if run.state == .running {
+            antiCheat.ingest(fix)
+            checkIn.update(with: fix)
+        }
+        if run.state == .running, navigation.isNavigating {
+            navigation.update(with: fix)
+            if preferences.crossingAlerts { crossings.update(progress: navigation.progress) }
+        }
         evaluateOffers()
     }
 
@@ -127,6 +200,11 @@ final class AppState {
         setDestination(PlannedDestination(business: offer.business), note: "Off-Peak Quest")
         mapFocus = .partner(offer.business.id)
         Haptics.tap()
+        // Accepted mid-run: check in there instead, and reroute through the business right away.
+        if run.isActive {
+            checkIn.start(target: PlannedDestination(business: offer.business))
+            reroute(viaDestination: true)
+        }
     }
 
     func dismiss(_ offer: QuestOffer) {
@@ -147,11 +225,188 @@ final class AppState {
     func setDestination(_ destination: PlannedDestination, note: String? = nil) {
         self.destination = destination
         destinationNote = note
+        if !run.isActive { generateRoutes() }
     }
 
     func clearDestination() {
         destination = nil
         destinationNote = nil
+        routeTask?.cancel()
+        routeOptions = []
+        selectedRouteID = nil
+        isGeneratingRoutes = false
+        resetAIRoute()
+        if !navigation.isNavigating { crossings.reset() }
+    }
+
+    // MARK: Routes
+
+    var selectedRoute: RouteOption? {
+        routeOptions.first { $0.id == selectedRouteID } ?? routeOptions.first
+    }
+
+    /// The plan that routes are built for: the pending one, or the last-used defaults.
+    var planForRouting: RunPlan { pendingPlan ?? planStore.lastPlan }
+
+    /// Builds 2–3 route options from here to the destination that fit the plan's goal.
+    func generateRoutes() {
+        guard let here = currentLocation?.coordinate, let destination else { return }
+        let plan = planForRouting
+        let request = RouteGenerator.Request(start: here, destination: destination.coordinate,
+                                             destinationName: destination.name,
+                                             target: targetDistance(for: plan), shape: plan.shape,
+                                             transport: plan.activity.transportType)
+        routeTask?.cancel()
+        routeOptions = []
+        selectedRouteID = nil
+        isGeneratingRoutes = true
+        resetAIRoute()
+        routeTask = Task {
+            let options = await routeGenerator.options(for: request)
+            guard !Task.isCancelled else { return }
+            routeOptions = options
+            selectedRouteID = options.first?.id
+            isGeneratingRoutes = false
+            prepareCrossings()
+            // The standard routes are ready (and are the fallback), so now let the AI try for a nicer one.
+            planAIRoute(request: request, plan: plan, baseline: options.first)
+        }
+    }
+
+    // MARK: AI route agent
+
+    private func resetAIRoute() {
+        aiTask?.cancel()
+        aiSuggestion = nil
+        aiPlanningStep = nil
+        aiRouteError = nil
+        showAISuggestion = true
+    }
+
+    /// Asks the route agent for a scenic route. On success it's inserted first and selected;
+    /// on any failure the RouteGenerator's options stay as they are, with a small "AI unavailable" note.
+    private func planAIRoute(request: RouteGenerator.Request, plan: RunPlan, baseline: RouteOption?) {
+        guard preferences.aiRouteSuggestions else { return }
+        guard ai.isAvailable else {
+            aiRouteError = ai.connection == .unavailable ? .notConfigured : (ai.lastError ?? .rateLimited(retryAfter: nil))
+            return
+        }
+        let destinationID = destination?.id
+        let context = RouteAgent.Context(request: request, plan: plan,
+                                         interests: Array(preferences.interests).sorted { $0.rawValue < $1.rawValue },
+                                         secondsPerMeter: planStore.pace(for: plan.activity).secondsPerMeter,
+                                         baseline: baseline)
+        aiPlanningStep = "Planning a scenic route…"
+        aiTask = Task {
+            do {
+                let suggestion = try await RouteAgent(ai: ai, generator: routeGenerator)
+                    .suggest(context) { step in self.aiPlanningStep = step }
+                // Ignore late answers if the user moved on.
+                guard !Task.isCancelled, destination?.id == destinationID, !run.isActive else { return }
+                routeOptions.insert(suggestion.option, at: 0)
+                aiSuggestion = suggestion
+                showAISuggestion = true
+                selectRoute(suggestion.option.id)
+                Haptics.success()
+            } catch {
+                guard !Task.isCancelled else { return }
+                aiRouteError = error as? AIError ?? .invalidResponse
+            }
+            aiPlanningStep = nil
+        }
+    }
+
+    func selectRoute(_ id: RouteOption.ID) {
+        selectedRouteID = id
+        prepareCrossings()
+    }
+
+    /// Fetch crossing data for the selected (or active) route ahead of time, so alerts are ready.
+    func prepareCrossings() {
+        guard preferences.crossingAlerts, let route = navigation.route ?? selectedRoute else { return }
+        crossings.prepare(route)
+    }
+
+    /// Off route: build a new route from here to the rest of the plan and keep navigating.
+    /// - Parameter viaDestination: force the route through the destination (e.g. a quest accepted mid-run).
+    func reroute(viaDestination: Bool = false) {
+        guard let here = currentLocation?.coordinate, !isRerouting else { return }
+        let plan = activePlan ?? planForRouting
+        let stillHeadingOut = viaDestination || !navigation.reachedDestination || !navigation.isNavigating
+        let finish = plan.shape == .outAndBack ? runStart : nil
+        let via = stillHeadingOut ? destination?.coordinate : nil
+        isRerouting = true
+        Task {
+            if let option = await routeGenerator.reroute(from: here, via: via, to: finish,
+                                                         destinationName: destination?.name ?? "your destination",
+                                                         transport: plan.activity.transportType) {
+                navigation.start(option)
+                prepareCrossings()
+                if let arrival = option.destinationArrival {
+                    checkIn.arrivalPoint = CLLocation(latitude: arrival.latitude, longitude: arrival.longitude)
+                }
+                if demo.isPlaying || developer.demoMode || isFakeCarRun { startDemoPlayback(along: option, plan: plan) }
+            }
+            isRerouting = false
+        }
+    }
+
+    private func startDemoPlayback(along route: RouteOption, plan: RunPlan) {
+        if isFakeCarRun {
+            // 13.4 m/s = 30 mph at real time: obviously a car.
+            demo.start(along: route.coordinates, metersPerSecond: 13.4, multiplier: 1,
+                       dwellAt: route.destinationDistance)
+            return
+        }
+        let metersPerSecond = 1 / planStore.pace(for: plan.activity).secondsPerMeter
+        demo.start(along: route.coordinates, metersPerSecond: metersPerSecond, multiplier: developer.demoSpeed,
+                   dwellAt: route.destinationDistance)
+    }
+
+    /// Developer button: play the selected route at car speed so anti-cheat rejects it, live.
+    func startFakeCarRun() {
+        guard destination != nil, selectedRoute != nil else { return }
+        isFakeCarRun = true
+        startRun(with: planForRouting)
+    }
+
+    // MARK: Check-in
+
+    /// Runner stayed 10 s at the destination: verify, unlock the partner reward, celebrate.
+    private func handleCheckIn(at place: PlannedDestination) {
+        checkedInDestination = place
+        let verification = currentVerification()
+        let isFirstVisit = !history.visitedIDs.contains(place.id)
+
+        var unlocked: String?
+        var locked: String?
+        if place.isPartner, let accepted = acceptedQuest, accepted.business.id == place.id {
+            runQuestID = accepted.quest.id
+            if verification.passed {
+                questStore.complete(accepted.quest.id)
+                history.saveReward(EarnedReward(business: place, reward: accepted.quest.reward,
+                                                questId: accepted.quest.id, runId: runID))
+                unlocked = accepted.quest.reward
+            } else {
+                locked = accepted.quest.reward
+            }
+        }
+        // Passport stamp: first VERIFIED check-in at this place.
+        var earnedStamp = false
+        if verification.passed, !history.hasStamp(for: place.id) {
+            history.saveStamp(Stamp(place: place, runId: runID))
+            earnedStamp = true
+        }
+        celebration = CheckInEvent(destination: place, reward: unlocked, lockedReward: locked,
+                                   verification: verification, isFirstVisit: isFirstVisit, earnedStamp: earnedStamp)
+        verification.passed ? Haptics.success() : Haptics.error()
+    }
+
+    /// Anti-cheat verdict for the run so far.
+    func currentVerification() -> VerificationResult {
+        antiCheat.evaluate(distance: run.distanceMeters, duration: run.elapsed(),
+                           pedometerSteps: motion.steps, motionDenied: motion.isDenied,
+                           enabled: developer.antiCheatEnabled)
     }
 
     /// Target distance (meters) for a plan, using the user's pace for time goals.
@@ -159,39 +414,80 @@ final class AppState {
         plan.targetDistance(secondsPerMeter: planStore.pace(for: plan.activity).secondsPerMeter)
     }
 
-    /// "Surprise me": picks a destination whose estimated route distance fits the plan.
-    ///
-    /// For now the estimate is straight-line × 1.25. Section B replaces it with real walking-route
-    /// distances and a wider ring search.
-    /// Preference order: partners with a live quest → other partners → real places.
-    /// Randomized within the best tier so "surprise" stays surprising.
-    func surpriseDestination(for plan: RunPlan) -> (PlannedDestination, String)? {
-        guard let here = currentLocation else { return nil }
-        let range = plan.destinationRange(target: targetDistance(for: plan))
+    // MARK: Planning (Plan sheet → find destinations → choose → start)
 
-        struct Candidate { let destination: PlannedDestination; let estimate: Double; let tier: Int }
-        let partnerCandidates = partners.map { business in
-            let live = business.isSlow && questStore.openQuest(for: business.id) != nil
-            return Candidate(destination: PlannedDestination(business: business),
-                             estimate: here.distance(from: business.location) * QuestMatcher.streetFactor,
-                             tier: live ? 0 : 1)
-        }
-        let placeCandidates = places.places.map { place in
-            Candidate(destination: PlannedDestination(place: place),
-                      estimate: here.distance(from: place.location) * QuestMatcher.streetFactor, tier: 2)
-        }
-        let all = partnerCandidates + placeCandidates
-        guard !all.isEmpty else { return nil }
+    /// Starts the goal-matched destination search for a plan. The plan stays pending until the run starts.
+    func findDestinations(for plan: RunPlan) {
+        planStore.save(plan)
+        pendingPlan = plan
+        guard let here = currentLocation else { return }
+        finder.find(plan: plan, target: targetDistance(for: plan), from: here,
+                    partners: partners,
+                    openQuest: { [questStore] id in questStore.openQuest(for: id) },
+                    nearbyPlaces: places.places)
+    }
 
-        let fitting = all.filter { range.contains($0.estimate) }
-        if let bestTier = fitting.map(\.tier).min(),
-           let pick = fitting.filter({ $0.tier == bestTier }).randomElement() {
-            return (pick.destination, "Surprise pick")
+    /// Picks one destination from the results. Choosing a partner with a live quest accepts the quest.
+    func choose(_ match: DestinationMatch, note: String? = nil) {
+        if let questID = match.questID {
+            questStore.accept(questID)
+            bannerOffer = nil
         }
-        // Nothing in range yet: take whatever is closest to the middle of the range.
-        let middle = (range.lowerBound + range.upperBound) / 2
-        guard let closest = all.min(by: { abs($0.estimate - middle) < abs($1.estimate - middle) }) else { return nil }
-        return (closest.destination, "Closest match nearby")
+        setDestination(match.destination, note: note ?? (match.hasQuest ? "Off-Peak Quest" : "Fits your goal"))
+        mapFocus = match.destination.isPartner ? .partner(match.id) : .place(match.id)
+    }
+
+    /// "Surprise me": random pick from the best few (quests first, since they sort to the top).
+    func surpriseMatch() -> DestinationMatch? {
+        finder.matches.prefix(3).randomElement()
+    }
+
+    /// Start button once a plan is pending.
+    func startPlannedRun() {
+        startRun(with: planForRouting)
+    }
+
+    func cancelPlan() {
+        pendingPlan = nil
+        finder.reset()
+    }
+
+    /// Looks up a real place by id in the nearby cache or in the destination results
+    /// (ring searches can find places outside the nearby cache).
+    func realPlace(id: RealPlace.ID) -> RealPlace? {
+        places.place(id: id) ?? finder.match(id: id)?.realPlace
+    }
+
+    // MARK: Map presentation
+
+    /// Direction the user faces: GPS course while moving (also what Demo Mode produces), compass otherwise.
+    var userHeading: Double? {
+        if let fix = currentLocation, fix.course >= 0, fix.speed > 1 { return fix.course }
+        return location.heading
+    }
+
+    func pinStatus(for business: Business, selected: Bool) -> PinStatus {
+        PinStatus(isSelected: selected,
+                  hasQuest: business.isSlow && questStore.openQuest(for: business.id) != nil,
+                  isNew: business.isNew,
+                  isRecommended: recommendedIDs.contains(business.id),
+                  isVisited: visitedIDs.contains(business.id),
+                  isDestination: destination?.id == business.id,
+                  matchLabel: matchLabel(for: business.id))
+    }
+
+    func pinStatus(for place: RealPlace, selected: Bool) -> PinStatus {
+        PinStatus(isSelected: selected,
+                  isRecommended: recommendedIDs.contains(place.id),
+                  isVisited: visitedIDs.contains(place.id),
+                  isDestination: destination?.id == place.id,
+                  matchLabel: matchLabel(for: place.id))
+    }
+
+    /// "2.9 mi · 96%" under pins that are goal-matched destinations.
+    func matchLabel(for id: String) -> String? {
+        guard let match = finder.match(id: id) else { return nil }
+        return "\(Format.distance(match.totalDistance)) · \(Int((match.fit * 100).rounded()))%"
     }
 
     // MARK: Places
@@ -203,15 +499,40 @@ final class AppState {
 
     // MARK: Run controls
 
-    /// Starts a run from the "Plan your run" sheet. The plan is saved as next time's default.
+    /// Starts a run with a plan. The plan is saved as next time's default.
     func startRun(with plan: RunPlan) {
         planStore.save(plan)
         activePlan = plan
-        if plan.surpriseMe, let (pick, note) = surpriseDestination(for: plan) {
-            setDestination(pick, note: note)
-            mapFocus = pick.isPartner ? .partner(pick.id) : .place(pick.id)
+        pendingPlan = nil
+        finder.reset()   // results leave the map once the run starts; the destination stays
+        runStart = currentLocation?.coordinate
+        // With a chosen route, the goal is that route's real length.
+        let route = destination == nil ? nil : selectedRoute
+        run.start(targetDistance: route?.distance ?? targetDistance(for: plan))
+
+        // Anti-cheat and check-in. Demo playback is time-compressed ×N and has no real steps,
+        // so it gets normalized speeds and synthetic steps (none at all for the fake car run).
+        runID = UUID().uuidString
+        runQuestID = nil
+        checkedInDestination = nil
+        lastFinishedRun = nil
+        let playback = route != nil && (developer.demoMode || isFakeCarRun)
+        // Realistic synthetic steps: ~1.15 steps/m running (≈185 spm at 10:00/mi), ~1.4 walking.
+        let stepsPerMeter: Double? = playback
+            ? (isFakeCarRun || plan.activity == .bike ? 0 : (plan.activity == .walk ? 1.4 : 1.15))
+            : nil
+        antiCheat.start(activity: plan.activity,
+                        timeScale: playback && !isFakeCarRun ? developer.demoSpeed : 1,
+                        syntheticStepsPerMeter: stepsPerMeter)
+        if !playback { motion.start() }
+        checkIn.start(target: destination, arrival: route?.destinationArrival)
+
+        if let route {
+            navigation.start(route)
+            prepareCrossings()   // no-op if already fetched while the route was selected
+            routeOptions = []
+            if playback { startDemoPlayback(along: route, plan: plan) }
         }
-        run.start(targetDistance: targetDistance(for: plan))
         location.setBackgroundTracking(true)
         // Ask for permissions at the moment they matter: when a run actually starts.
         if location.authorization == .authorizedWhenInUse {
@@ -220,21 +541,85 @@ final class AppState {
         NotificationService.requestAuthorizationIfNeeded()
     }
 
-    func pauseRun() { run.pause() }
-    func resumeRun() { run.resume() }
+    func pauseRun() {
+        run.pause()
+        demo.pause()
+    }
+
+    func resumeRun() {
+        run.resume()
+        demo.resume()
+    }
 
     func endRun() {
         run.end()
+        demo.stop()
+        navigation.stop()
+        crossings.reset()
+        motion.stop()
+        checkIn.stop()
         location.setBackgroundTracking(false)
-        if let plan = activePlan, let pace = run.averagePace {
+
+        let verification = currentVerification()
+        // Only real, verified runs teach the app your pace.
+        if let plan = activePlan, let pace = run.averagePace, verification.passed, !demo.isPlaying, !developer.demoMode {
             planStore.recordPace(pace, distance: run.distanceMeters, activity: plan.activity)
         }
+
+        let record = RunRecord(id: runID, date: run.startDate ?? .now, plan: activePlan, destination: destination,
+                               checkedIn: checkedInDestination != nil, questId: runQuestID,
+                               distanceMeters: run.distanceMeters, durationSeconds: run.elapsed(),
+                               averagePace: run.averagePace, route: thinnedTrace(), verification: verification)
+        // Skip accidental Start → End taps.
+        if run.distanceMeters > 20 || checkedInDestination != nil {
+            history.save(record)
+            // Milestone badges are re-checked against the full verified history.
+            if verification.passed {
+                let fresh = history.awardNewBadges()
+                if !fresh.isEmpty {
+                    badgeCelebration = fresh
+                    Haptics.success()
+                }
+            }
+        }
+        lastFinishedRun = record
+    }
+
+    /// The GPS trace with points at least 5 m apart (smaller to store, same shape on a map).
+    private func thinnedTrace() -> [GeoPoint] {
+        var result: [GeoPoint] = []
+        var last: CLLocation?
+        for fix in run.trace where last == nil || fix.distance(from: last!) >= 5 {
+            result.append(GeoPoint(fix.coordinate))
+            last = fix
+        }
+        return result
     }
 
     /// "Done" on the finished-run card.
     func resetRun() {
         run.reset()
         activePlan = nil
+        lastFinishedRun = nil
+        isFakeCarRun = false
         if acceptedQuest == nil { clearDestination() }
+    }
+
+    // MARK: Future Places
+
+    func toggleSaved(_ destination: PlannedDestination, source: SavedPlace.Source = .map) {
+        if history.isSaved(destination.id) {
+            history.removeSavedPlace(id: destination.id)
+        } else {
+            history.savePlace(destination, source: source)
+            Haptics.success()
+        }
+    }
+
+    /// "Plan a run here" from My Places: make it the destination and build routes for the last plan.
+    func planRun(to destination: PlannedDestination) {
+        cancelPlan()
+        setDestination(destination, note: "From My Places")
+        mapFocus = destination.isPartner ? .partner(destination.id) : .place(destination.id)
     }
 }

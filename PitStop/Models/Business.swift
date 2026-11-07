@@ -29,4 +29,9 @@ struct Business: Identifiable, Codable, Hashable, Sendable {
     var location: CLLocation {
         CLLocation(latitude: latitude, longitude: longitude)
     }
+
+    /// Joined PitStop in the last 7 days. Gets a "New" sparkle on the map.
+    var isNew: Bool {
+        Date.now.timeIntervalSince(createdAt) < 7 * 24 * 3600
+    }
 }

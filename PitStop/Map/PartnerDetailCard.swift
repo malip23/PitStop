@@ -33,8 +33,11 @@ struct PartnerDetailCard: View {
                     CloseButton(action: onClose)
                 }
                 questSection
-                DestinationButton(isCurrent: app.destination?.id == business.id) {
-                    app.setDestination(PlannedDestination(business: business))
+                HStack(spacing: 8) {
+                    DestinationButton(isCurrent: app.destination?.id == business.id) {
+                        app.setDestination(PlannedDestination(business: business))
+                    }
+                    SaveForLaterButton(destination: PlannedDestination(business: business))
                 }
             }
         }

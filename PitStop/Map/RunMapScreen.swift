@@ -8,28 +8,60 @@ struct RunMapScreen: View {
     @State private var camera: MapCameraPosition = .userLocation(fallback: .automatic)
     @State private var selection: MapSelection?
     @State private var showPlanSheet = false
+    @State private var showLegend = false
+    @State private var showQuests = false
+    /// Last camera the map reported. Lets animations keep the current zoom, rotation, and pitch.
+    @State private var lastCamera: MapCamera?
+    /// Set when code (not a tap) changes the selection, so we don't also re-center on the pin.
+    @State private var skipSelectionCamera = false
+    /// While navigating, the camera follows the runner (toggle with the follow button).
+    @State private var followRunner = true
 
     var body: some View {
         Map(position: $camera, selection: $selection) {
-            UserAnnotation()
-
-            // Breadcrumb of where the runner has been.
-            if app.run.trace.count > 1 {
-                MapPolyline(coordinates: app.run.trace.map(\.coordinate))
-                    .stroke(.blue.opacity(0.6), style: StrokeStyle(lineWidth: 4, lineCap: .round, lineJoin: .round))
-            }
-
-            // Until real routes exist (section C), a dashed line points at the destination.
-            if let destination = app.destination, let here = app.currentLocation {
-                MapPolyline(coordinates: [here.coordinate, destination.coordinate])
-                    .stroke(Color.accentColor.opacity(0.7),
-                            style: StrokeStyle(lineWidth: 3, lineCap: .round, dash: [6, 8]))
+            if app.navigation.isNavigating {
+                // Navigating: covered part of the route in lime, what's left in the coral gradient.
+                if app.navigation.remainingCoordinates.count > 1 {
+                    GlowingRoute(coordinates: app.navigation.remainingCoordinates)
+                }
+                if app.navigation.completedCoordinates.count > 1 {
+                    GlowingRoute(coordinates: app.navigation.completedCoordinates,
+                                 colors: Theme.completedGradient, lineWidth: 7)
+                }
+            } else {
+                // Free run: the path covered so far.
+                if app.run.trace.count > 1 {
+                    GlowingRoute(coordinates: app.run.trace.map(\.coordinate),
+                                 colors: Theme.completedGradient, lineWidth: 6)
+                }
+                // Before the run: every route option, with the selected one highlighted.
+                ForEach(app.routeOptions.filter { $0.id != app.selectedRoute?.id }) { option in
+                    MapPolyline(coordinates: option.coordinates)
+                        .stroke(Theme.coral.opacity(0.35), style: StrokeStyle(lineWidth: 5, lineCap: .round, lineJoin: .round))
+                }
+                if let selected = app.selectedRoute {
+                    GlowingRoute(coordinates: selected.coordinates)
+                } else if let destination = app.destination, let here = app.currentLocation {
+                    // While routes load: a dashed line toward the destination.
+                    MapPolyline(coordinates: [here.coordinate, destination.coordinate])
+                        .stroke(Theme.coral.opacity(0.8),
+                                style: StrokeStyle(lineWidth: 3.5, lineCap: .round, dash: [6, 8]))
+                }
             }
 
             // Real places first so partner pins draw on top of them.
             ForEach(app.places.places) { place in
                 Annotation(place.name, coordinate: place.coordinate) {
-                    RealPlacePin(place: place, isSelected: selection == .place(place.id))
+                    RealPlacePin(place: place, status: app.pinStatus(for: place, selected: selection == .place(place.id)))
+                }
+                .tag(MapSelection.place(place.id))
+                .annotationTitles(.hidden)
+            }
+
+            // Goal-matched places from ring searches that aren't in the nearby cache.
+            ForEach(extraMatchPlaces) { place in
+                Annotation(place.name, coordinate: place.coordinate) {
+                    RealPlacePin(place: place, status: app.pinStatus(for: place, selected: selection == .place(place.id)))
                 }
                 .tag(MapSelection.place(place.id))
                 .annotationTitles(.hidden)
@@ -38,36 +70,108 @@ struct RunMapScreen: View {
             ForEach(app.partners) { business in
                 Annotation(business.name, coordinate: business.coordinate, anchor: .bottom) {
                     BusinessPin(business: business,
-                                isSelected: selection == .partner(business.id),
-                                hasQuest: business.isSlow && app.questStore.openQuest(for: business.id) != nil)
+                                status: app.pinStatus(for: business, selected: selection == .partner(business.id)))
                 }
                 .tag(MapSelection.partner(business.id))
             }
 
-            if let destination = app.destination {
+            // Destination that isn't one of the pins above (e.g. its place dropped out of the search cache).
+            if let destination = app.destination, !destinationHasPin(destination) {
                 Annotation("Destination", coordinate: destination.coordinate, anchor: .bottom) {
                     DestinationFlag()
-                        .offset(y: destination.isPartner ? -52 : -14)
+                }
+                .annotationTitles(.hidden)
+            }
+
+            // Upcoming crosswalks, signals, and intersections (next 300 m) while navigating.
+            if app.navigation.isNavigating && app.preferences.crossingAlerts {
+                ForEach(app.crossings.upcomingPoints) { point in
+                    Annotation(point.kind.title, coordinate: point.coordinate) {
+                        CrossingMarker(point: point, isActive: app.crossings.activeAlert?.id == point.id)
+                    }
+                    .annotationTitles(.hidden)
+                }
+            }
+
+            // Custom "you" marker with heading arrow. Uses the app's location, so Demo Mode moves it too.
+            if let here = app.currentLocation {
+                Annotation("You", coordinate: here.coordinate) {
+                    UserLocationMarker(heading: app.userHeading, mapHeading: lastCamera?.heading ?? 0)
                 }
                 .annotationTitles(.hidden)
             }
         }
-        .mapStyle(.standard(elevation: .realistic, pointsOfInterest: .excludingAll))
+        // Muted base map without Apple's POI icons, so our own pins carry the design.
+        .mapStyle(.standard(elevation: .realistic, emphasis: .muted, pointsOfInterest: .excludingAll))
         .mapControls {
             MapUserLocationButton()
             MapCompass()
             MapScaleView()
         }
-        .overlay(alignment: .top) { searchStatus }
+        .onMapCameraChange(frequency: .onEnd) { context in
+            lastCamera = context.camera
+        }
+        .onChange(of: selection) { _, newValue in
+            if skipSelectionCamera { skipSelectionCamera = false; return }
+            if let newValue { centerCamera(on: newValue) }
+        }
+        .onChange(of: app.run.state) { _, state in
+            if state == .running { followRunner = true; cameraForRunStart() }
+        }
+        .onChange(of: app.currentLocation?.timestamp) { _, _ in
+            followCameraIfNeeded()
+        }
+        .onChange(of: app.selectedRouteID) { _, _ in
+            if let route = app.selectedRoute { frame(route) }
+        }
+        .overlay(alignment: .topLeading) {
+            if !app.navigation.isNavigating {
+                VStack(spacing: 10) {
+                    legendButton
+                    if app.developer.role == .runner { questsButton }
+                }
+            }
+        }
+        .overlay(alignment: .top) {
+            if app.navigation.isNavigating {
+                VStack(alignment: .leading, spacing: 8) {
+                    NavigationBanner()
+                    if let alert = app.crossings.activeAlert, app.preferences.crossingAlerts {
+                        CrossingAlertBanner(point: alert,
+                                            distance: max(0, alert.distanceAlongRoute - app.navigation.progress))
+                            .transition(.move(edge: .top).combined(with: .opacity))
+                    }
+                    followButton
+                }
+                .animation(.spring(duration: 0.35), value: app.crossings.activeAlert?.id)
+                .padding(.horizontal)
+                .padding(.top, 4)
+                .transition(.move(edge: .top).combined(with: .opacity))
+            } else {
+                searchStatus
+            }
+        }
+        .animation(.snappy, value: app.navigation.isNavigating)
         .safeAreaInset(edge: .bottom) {
             VStack(spacing: 10) {
                 selectionCard
-                if let accepted = app.acceptedQuest, selection != .partner(accepted.business.id) {
+                if app.navigation.isNavigating {
+                    // The navigation banner covers destination info during the run.
+                } else if let accepted = app.acceptedQuest, selection != .partner(accepted.business.id) {
                     AcceptedQuestCard(quest: accepted.quest, business: accepted.business)
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 } else if let destination = app.destination, selection == nil {
                     DestinationCard(destination: destination)
                         .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+                if app.destination != nil, !app.run.isActive, app.run.state != .finished {
+                    if let suggestion = app.aiSuggestion, app.showAISuggestion {
+                        AIRouteSuggestionCard(suggestion: suggestion)
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                    } else {
+                        RouteOptionsCard()
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
                 }
                 if !app.location.isAuthorized {
                     LocationPermissionCard()
@@ -79,9 +183,18 @@ struct RunMapScreen: View {
             .animation(.snappy, value: selection)
             .animation(.snappy, value: app.acceptedQuest?.quest.id)
             .animation(.snappy, value: app.destination?.id)
+            .animation(.snappy, value: app.showAISuggestion)
+            .animation(.snappy, value: app.aiSuggestion?.option.id)
         }
         .sheet(isPresented: $showPlanSheet) {
             PlanRunSheet()
+        }
+        .sheet(isPresented: $showLegend) {
+            MapLegendSheet()
+        }
+        .sheet(isPresented: $showQuests) {
+            QuestsScreen(onAccepted: { showQuests = false })
+                .presentationDetents([.medium, .large])
         }
         .onChange(of: app.mapFocus) { _, target in
             guard let target else { return }
@@ -97,6 +210,89 @@ struct RunMapScreen: View {
         }
     }
 
+    private var extraMatchPlaces: [RealPlace] {
+        app.finder.matches.compactMap(\.realPlace).filter { app.places.place(id: $0.id) == nil }
+    }
+
+    // MARK: Camera
+
+    /// Keeps the runner centered, facing their direction of travel, while navigating.
+    private func followCameraIfNeeded() {
+        guard app.navigation.isNavigating, followRunner, app.run.state == .running,
+              let here = app.currentLocation?.coordinate else { return }
+        withAnimation(.linear(duration: 0.9)) {
+            camera = .camera(MapCamera(centerCoordinate: here, distance: 550,
+                                       heading: app.userHeading ?? lastCamera?.heading ?? 0, pitch: 55))
+        }
+    }
+
+    /// Fits a route option on screen when it's selected.
+    private func frame(_ route: RouteOption) {
+        guard !route.coordinates.isEmpty else { return }
+        let rect = MKPolyline(coordinates: route.coordinates, count: route.coordinates.count).boundingMapRect
+        let padded = rect.insetBy(dx: -rect.width * 0.25, dy: -rect.height * 0.45)
+        withAnimation(.smooth(duration: 0.7)) {
+            camera = .rect(padded)
+        }
+    }
+
+    private var followButton: some View {
+        Button {
+            followRunner.toggle()
+            if followRunner { followCameraIfNeeded() }
+        } label: {
+            Label(followRunner ? "Following" : "Follow me",
+                  systemImage: followRunner ? "location.north.line.fill" : "location.north.line")
+                .font(.caption.weight(.semibold))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .background(.regularMaterial, in: Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func coordinate(of target: MapSelection) -> CLLocationCoordinate2D? {
+        switch target {
+        case .partner(let id): app.partner(id: id)?.coordinate
+        case .place(let id): app.realPlace(id: id)?.coordinate
+            ?? (app.destination?.id == id ? app.destination?.coordinate : nil)
+        }
+    }
+
+    private func destinationHasPin(_ destination: PlannedDestination) -> Bool {
+        destination.isPartner ? app.partner(id: destination.id) != nil : app.realPlace(id: destination.id) != nil
+    }
+
+    /// Smoothly glides to a tapped pin, keeping the current zoom, rotation, and tilt.
+    private func centerCamera(on target: MapSelection) {
+        guard let coordinate = coordinate(of: target) else { return }
+        let distance = min(lastCamera?.distance ?? 1500, 2500)
+        withAnimation(.smooth(duration: 0.6)) {
+            camera = .camera(MapCamera(centerCoordinate: coordinate, distance: distance,
+                                       heading: lastCamera?.heading ?? 0, pitch: lastCamera?.pitch ?? 0))
+        }
+    }
+
+    /// When a run starts, swoop into a tilted view facing the way you're going: framing you and the
+    /// destination if there is one, otherwise close around you.
+    private func cameraForRunStart() {
+        guard let here = app.currentLocation?.coordinate else { return }
+        guard let destination = app.destination?.coordinate else {
+            withAnimation(.easeInOut(duration: 1.2)) {
+                camera = .camera(MapCamera(centerCoordinate: here, distance: 900,
+                                           heading: app.userHeading ?? 0, pitch: 55))
+            }
+            return
+        }
+        let center = CLLocationCoordinate2D(latitude: (here.latitude + destination.latitude) / 2,
+                                            longitude: (here.longitude + destination.longitude) / 2)
+        withAnimation(.easeInOut(duration: 1.2)) {
+            camera = .camera(MapCamera(centerCoordinate: center,
+                                       distance: max(here.distance(to: destination) * 2.4, 900),
+                                       heading: here.bearing(to: destination), pitch: 45))
+        }
+    }
+
     /// Frames both the runner and the target pin (after accepting a quest or a surprise pick).
     private func focus(on target: MapSelection) {
         let coordinate: CLLocationCoordinate2D
@@ -104,10 +300,14 @@ struct RunMapScreen: View {
         case .partner(let id):
             guard let business = app.partner(id: id) else { return }
             coordinate = business.coordinate
-            selection = target
+            if selection != target {
+                skipSelectionCamera = true
+                selection = target
+            }
         case .place(let id):
-            guard let place = app.places.place(id: id) else { return }
-            coordinate = place.coordinate
+            guard let point = app.realPlace(id: id)?.coordinate
+                    ?? (app.destination?.id == id ? app.destination?.coordinate : nil) else { return }
+            coordinate = point
         }
         let here = app.currentLocation?.coordinate ?? coordinate
         let center = CLLocationCoordinate2D(latitude: (here.latitude + coordinate.latitude) / 2,
@@ -126,13 +326,57 @@ struct RunMapScreen: View {
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         case .place(let id):
-            if let place = app.places.place(id: id) {
+            if let place = app.realPlace(id: id) {
                 RealPlaceDetailCard(place: place) { selection = nil }
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         case nil:
             EmptyView()
         }
+    }
+
+    /// Opens the ranked list of Off-Peak Quests (with score breakdowns), badged with the count.
+    private var questsButton: some View {
+        Button {
+            showQuests = true
+        } label: {
+            Image(systemName: "flag.checkered")
+                .font(.system(size: 17, weight: .bold))
+                .foregroundStyle(Theme.coral)
+                .frame(width: 44, height: 44)
+                .background(.regularMaterial, in: Circle())
+                .overlay(alignment: .topTrailing) {
+                    let count = app.offers.count
+                    if count > 0 {
+                        Text("\(count)")
+                            .font(.caption2.weight(.heavy))
+                            .foregroundStyle(.white)
+                            .frame(minWidth: 18, minHeight: 18)
+                            .background(Theme.coralDeep, in: Circle())
+                            .offset(x: 4, y: -4)
+                    }
+                }
+                .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
+        }
+        .padding(.leading, 12)
+        .accessibilityLabel("Off-Peak Quests")
+    }
+
+    private var legendButton: some View {
+        Button {
+            showLegend = true
+        } label: {
+            Image(systemName: "info.circle.fill")
+                .font(.title2)
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(Theme.coral)
+                .frame(width: 44, height: 44)
+                .background(.regularMaterial, in: Circle())
+                .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
+        }
+        .padding(.leading, 12)
+        .padding(.top, 8)
+        .accessibilityLabel("Map legend")
     }
 
     /// Small capsule at the top while searching, or if the search failed.

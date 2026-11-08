@@ -21,16 +21,5 @@
 	<string>PitStop keeps tracking your run and checks you in at quest businesses even when your phone is locked.</string>
 	<key>NSMotionUsageDescription</key>
 	<string>PitStop compares your step cadence with GPS speed to verify quest runs are real.</string>
-	<key>NSHealthShareUsageDescription</key>
-	<string>PitStop reads heart rate, workouts, steps, and running distance to show live heart rate and score your effort relative to your own baseline.</string>
-	<key>NSHealthUpdateUsageDescription</key>
-	<string>PitStop saves completed quest runs to Health as running workouts with their route.</string>
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>PitStop connects directly to a nearby business's phone to share quest offers, arrival times, and check-ins. Health data is never shared.</string>
-	<key>NSBonjourServices</key>
-	<array>
-		<string>_pitstop-run._tcp</string>
-		<string>_pitstop-run._udp</string>
-	</array>
 </dict>
 </plist>

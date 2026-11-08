@@ -10,8 +10,6 @@ final class DeveloperSettings {
     var demoSpeed: Double { didSet { save() } }
     /// Turn off anti-cheat (e.g. when simulating locations from Xcode during a demo).
     var antiCheatEnabled: Bool { didSet { save() } }
-    /// Runner or admin. Decides which tabs show (until accounts exist).
-    var role: UserRole { didSet { save() } }
 
     private let defaults = UserDefaults.standard
 
@@ -21,13 +19,11 @@ final class DeveloperSettings {
         demoSpeed = speed > 0 ? speed : 3
         defaults.register(defaults: ["dev.antiCheat": true])
         antiCheatEnabled = defaults.bool(forKey: "dev.antiCheat")
-        role = UserRole(rawValue: defaults.string(forKey: "dev.role") ?? "") ?? .runner
     }
 
     private func save() {
         defaults.set(demoMode, forKey: "dev.demoMode")
         defaults.set(demoSpeed, forKey: "dev.demoSpeed")
         defaults.set(antiCheatEnabled, forKey: "dev.antiCheat")
-        defaults.set(role.rawValue, forKey: "dev.role")
     }
 }

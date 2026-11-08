@@ -9,3 +9,6 @@ Secrets.xcconfig
 .dev.vars
 proxy/.wrangler/
 node_modules/
+
+# Private notes (demo script) — never committed
+*.local.md

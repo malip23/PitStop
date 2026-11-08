@@ -15,9 +15,6 @@ final class RunTracker {
     /// Goal distance for this run in meters, from the run plan. nil = free run.
     private(set) var targetDistance: Double?
 
-    /// Latest heart rate in BPM, written by HealthService (or the demo simulator). nil = unavailable.
-    var heartRate: Double?
-
     @ObservationIgnored private var accumulated: TimeInterval = 0
     @ObservationIgnored private var resumedAt: Date?
     /// Last fix that counted toward distance. Cleared on pause so the gap isn't counted on resume.
@@ -69,7 +66,6 @@ final class RunTracker {
         accumulated = 0
         resumedAt = nil
         lastCounted = nil
-        heartRate = nil
         targetDistance = nil
     }
 

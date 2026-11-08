@@ -2,53 +2,55 @@ import SwiftUI
 
 /// Top-level tabs, depending on role:
 /// - Runner: Run · My Places · Rewards · Settings
-/// - Admin:  Run · Business · Settings (an Admin tab arrives with accounts)
+/// - Business / Admin: Run · Business · Settings (+ Admin tab for admins)
 ///
-/// The quest-offer banner floats over runner tabs; the check-in celebration covers everything.
+/// Popups: on the Run tab the map hosts them (so the camera keeps the route clear of them); on other
+/// tabs they float here, above the tab bar. The check-in celebration covers everything.
 struct RootTabView: View {
-    enum TabID: Hashable { case run, myPlaces, rewards, business, settings }
-
     @Environment(AppState.self) private var app
-    @State private var selection: TabID = .run
+    @AppStorage("didOnboard") private var didOnboard = false
 
     var body: some View {
-        let role = app.developer.role
-        TabView(selection: $selection) {
+        @Bindable var app = app
+        let role = app.role
+        TabView(selection: $app.selectedTab) {
             RunMapScreen()
                 .tabItem { Label("Run", systemImage: "figure.run") }
-                .tag(TabID.run)
+                .tag(AppTab.run)
 
             if role == .runner {
-                MyPlacesScreen(onPlanRun: { selection = .run })
+                MyPlacesScreen(onPlanRun: { app.selectedTab = .run })
                     .tabItem { Label("My Places", systemImage: "mappin.and.ellipse") }
-                    .tag(TabID.myPlaces)
+                    .tag(AppTab.myPlaces)
 
                 RewardsScreen()
                     .tabItem { Label("Rewards", systemImage: "gift.fill") }
-                    .tag(TabID.rewards)
+                    .tag(AppTab.rewards)
             } else {
                 BusinessScreen()
                     .tabItem { Label("Business", systemImage: "storefront.fill") }
-                    .tag(TabID.business)
+                    .tag(AppTab.business)
+
+                if role == .admin {
+                    AdminScreen()
+                        .tabItem { Label("Admin", systemImage: "person.badge.key.fill") }
+                        .tag(AppTab.admin)
+                }
             }
 
             SettingsScreen()
                 .tabItem { Label("Settings", systemImage: "gearshape.fill") }
-                .tag(TabID.settings)
+                .tag(AppTab.settings)
         }
-        .onChange(of: role) { _, _ in selection = .run }
+        .onChange(of: role) { _, _ in app.selectedTab = .run }
         .overlay(alignment: .top) {
-            if let offer = app.bannerOffer, role == .runner {
-                QuestOfferBanner(offer: offer) {
-                    app.accept(offer)
-                    selection = .run
-                } onDismiss: {
-                    app.dismiss(offer)
-                }
-                .padding(.horizontal)
-                // While navigating on the Run tab, sit below the navigation banner.
-                .padding(.top, app.navigation.isNavigating && selection == .run ? 170 : 4)
-                .transition(.move(edge: .top).combined(with: .opacity))
+            if app.selectedTab != .run {
+                PopupHost(placement: .top).padding(.horizontal, 12).padding(.top, 4)
+            }
+        }
+        .overlay(alignment: .bottom) {
+            if app.selectedTab != .run {
+                PopupHost(placement: .bottom).padding(.horizontal, 12).padding(.bottom, 56) // above the tab bar
             }
         }
         .overlay {
@@ -61,7 +63,9 @@ struct RootTabView: View {
                     .transition(.opacity)
             }
         }
-        .animation(.spring(duration: 0.4), value: app.bannerOffer?.id)
+        .fullScreenCover(isPresented: Binding(get: { !didOnboard }, set: { didOnboard = !$0 })) {
+            OnboardingView { didOnboard = true }
+        }
         .animation(.easeInOut(duration: 0.25), value: app.celebration?.id)
         .animation(.easeInOut(duration: 0.25), value: app.badgeCelebration)
     }

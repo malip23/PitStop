@@ -5,7 +5,7 @@ import SwiftData
 /// Maps onto Firestore `users/{uid}/savedPlaces/{id}`.
 @Model
 final class SavedPlace {
-    enum Source: String, Codable { case map, narration, recommendation }
+    enum Source: String, Codable { case map, narration, recommendation, runSuggestion }
 
     /// Same id as the business or real place, so a place can only be saved once.
     @Attribute(.unique) var id: String

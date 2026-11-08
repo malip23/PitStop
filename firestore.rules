@@ -1,0 +1,76 @@
+rules_version = '2';
+
+// PitStop Firestore security rules.
+// Paste into Firebase console → Firestore Database → Rules → Publish (see README).
+//
+// Summary:
+// - users/{uid}: you read/write only your own doc, runs, rewards, and saved places, and you can
+//   never change your own role. Admins can read every user and change roles.
+// - businesses: any signed-in user can read; only business/admin accounts can create (as owner);
+//   only the owner or an admin can update/delete.
+// - quests: any signed-in user can read; the business owner (or admin) creates/ends them; a runner
+//   may only touch the runner fields (accept, ETA, completion, offer stats).
+// - visits: runners create their own; the runner, the business owner, or an admin can read.
+//   Visits hold no health data or routes, only the verification result.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function me() { return request.auth.uid; }
+    function myRole() { return get(/databases/$(database)/documents/users/$(me())).data.role; }
+    function isAdmin() { return signedIn() && myRole() == 'admin'; }
+    function canManageBusinesses() { return signedIn() && myRole() in ['business', 'admin']; }
+    function ownsBusiness(businessId) {
+      return get(/databases/$(database)/documents/businesses/$(businessId)).data.ownerUid == me();
+    }
+
+    // ---------- Users ----------
+    match /users/{uid} {
+      allow read: if signedIn() && (me() == uid || isAdmin());
+      // First sign-up: always a runner.
+      allow create: if signedIn() && me() == uid && request.resource.data.role == 'runner';
+      // Edit your own profile but not your role; admins can change anything (including roles).
+      allow update: if signedIn() && (
+        (me() == uid && request.resource.data.role == resource.data.role) || isAdmin());
+      allow delete: if isAdmin();
+
+      // Private subcollections: run history, rewards (stamps/badges/partner), saved places.
+      match /runs/{runId}        { allow read, write: if signedIn() && me() == uid; }
+      match /rewards/{rewardId}  { allow read, write: if signedIn() && me() == uid; }
+      match /savedPlaces/{id}    { allow read, write: if signedIn() && me() == uid; }
+    }
+
+    // Admin stats: count every user's runs (collection-group query).
+    match /{path=**}/runs/{runId} {
+      allow read: if isAdmin();
+    }
+
+    // ---------- Businesses ----------
+    match /businesses/{businessId} {
+      allow read: if signedIn();
+      allow create: if canManageBusinesses() && request.resource.data.ownerUid == me();
+      allow update, delete: if signedIn() && (resource.data.ownerUid == me() || isAdmin());
+    }
+
+    // ---------- Quests ----------
+    match /quests/{questId} {
+      allow read: if signedIn();
+      allow create: if signedIn() && (ownsBusiness(request.resource.data.businessId) || isAdmin());
+      allow update: if signedIn() && (
+        ownsBusiness(resource.data.businessId) || isAdmin()
+        // Runners may only change the runner-side fields.
+        || request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['status', 'runnerUid', 'etaSeconds', 'etaUpdatedAt', 'completedAt', 'offerStats'])
+      );
+      allow delete: if signedIn() && (ownsBusiness(resource.data.businessId) || isAdmin());
+    }
+
+    // ---------- Visits ----------
+    match /visits/{visitId} {
+      allow create: if signedIn() && request.resource.data.runnerUid == me();
+      allow read: if signedIn() && (
+        resource.data.runnerUid == me() || ownsBusiness(resource.data.businessId) || isAdmin());
+      allow update, delete: if isAdmin();
+    }
+  }
+}

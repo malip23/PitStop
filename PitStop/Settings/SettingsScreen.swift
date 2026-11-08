@@ -3,12 +3,15 @@ import SwiftUI
 /// App settings and developer tools.
 struct SettingsScreen: View {
     @Environment(AppState.self) private var app
+    @State private var confirmSignOut = false
 
     var body: some View {
         @Bindable var developer = app.developer
         @Bindable var preferences = app.preferences
         NavigationStack {
             Form {
+                accountSection
+
                 Section {
                     LabeledContent("Real places nearby", value: "\(app.places.places.count)")
                     Button {
@@ -62,11 +65,6 @@ struct SettingsScreen: View {
                 }
 
                 Section {
-                    Picker(selection: $developer.role) {
-                        ForEach(UserRole.allCases) { Text($0.displayName).tag($0) }
-                    } label: {
-                        Label("Role", systemImage: "person.crop.circle")
-                    }
                     Toggle(isOn: $developer.antiCheatEnabled) {
                         Label("Anti-cheat", systemImage: "checkmark.shield.fill")
                     }
@@ -77,9 +75,9 @@ struct SettingsScreen: View {
                     }
                     .disabled(app.destination == nil || app.selectedRoute == nil || app.run.isActive)
                 } header: {
-                    Text("Roles & anti-cheat")
+                    Text("Anti-cheat")
                 } footer: {
-                    Text("Role decides the tabs (runner: My Places + Rewards; admin: Business) until accounts exist. Turn anti-cheat off when simulating locations from Xcode. \"Fake run at car speed\" plays the selected route at 30 mph with no steps, so anti-cheat rejects it. Pick a destination and route on the map first.")
+                    Text("Turn anti-cheat off when simulating locations from Xcode. \"Fake run at car speed\" plays the selected route at 30 mph with no steps, so anti-cheat rejects it. Pick a destination and route on the map first.")
                 }
 
                 Section {
@@ -111,6 +109,20 @@ struct SettingsScreen: View {
                         Label("AI route suggestions", systemImage: "sparkles")
                     }
                     .tint(Theme.coral)
+                    Toggle(isOn: $preferences.runSuggestions) {
+                        Label("Quick-stop suggestions on runs", systemImage: "cup.and.saucer.fill")
+                    }
+                    .tint(Theme.coral)
+                    Toggle(isOn: $preferences.narration) {
+                        Label("City-guide narration", systemImage: "text.bubble.fill")
+                    }
+                    .tint(Theme.coral)
+                    if preferences.narration {
+                        Toggle(isOn: $preferences.narrationVoice) {
+                            Label("Speak narration aloud", systemImage: "speaker.wave.2.fill")
+                        }
+                        .tint(Theme.coral)
+                    }
                     NavigationLink {
                         InterestsPickerView()
                     } label: {
@@ -128,6 +140,54 @@ struct SettingsScreen: View {
                 }
             }
             .navigationTitle("Settings")
+            .confirmationDialog("Sign out of PitStop?", isPresented: $confirmSignOut, titleVisibility: .visible) {
+                Button("Sign out", role: .destructive) {
+                    app.previewAsRunner = false
+                    app.auth.signOut()
+                }
+            }
+        }
+    }
+}
+
+extension SettingsScreen {
+    /// Name, email, role (from Firestore), admin "preview as runner", and sign out.
+    @ViewBuilder var accountSection: some View {
+        @Bindable var app = app
+        Section {
+            HStack(spacing: 12) {
+                Text(String((app.auth.profile?.displayName ?? "?").prefix(1)).uppercased())
+                    .font(.title3.weight(.bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 44, height: 44)
+                    .background(Theme.coral.gradient, in: Circle())
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(app.auth.profile?.displayName ?? "Loading…").font(.headline)
+                    Text(app.auth.email ?? "").font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Text((app.auth.profile?.role ?? .runner).displayName)
+                    .font(.caption.weight(.bold))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Theme.coral.opacity(0.15), in: Capsule())
+                    .foregroundStyle(Theme.coral)
+            }
+            if app.auth.profile?.role.canManageBusinesses == true {
+                Toggle(isOn: $app.previewAsRunner) {
+                    Label("Preview as runner", systemImage: "eye")
+                }
+                .tint(Theme.coral)
+            }
+            Button("Sign out", role: .destructive) { confirmSignOut = true }
+        } header: {
+            Text("Account")
+        } footer: {
+            if app.auth.profile?.role.canManageBusinesses == true {
+                Text("Your role comes from Firestore. \"Preview as runner\" only changes this phone's tabs so you can demo both sides.")
+            } else {
+                Text("New accounts are runners. An admin can change your role.")
+            }
         }
     }
 }

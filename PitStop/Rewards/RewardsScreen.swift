@@ -143,6 +143,7 @@ struct RewardsScreen: View {
 
 /// A partner reward "ticket" with a mark-as-used action.
 struct PartnerRewardRow: View {
+    @Environment(AppState.self) private var app
     @Bindable var reward: EarnedReward
 
     var body: some View {
@@ -160,7 +161,7 @@ struct PartnerRewardRow: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
-            Button(reward.redeemed ? "Used" : "Use") { reward.redeemed = true }
+            Button(reward.redeemed ? "Used" : "Use") { app.history.markRedeemed(reward) }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .disabled(reward.redeemed)

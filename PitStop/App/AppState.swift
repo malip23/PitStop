@@ -37,6 +37,18 @@ final class AppState {
     let checkIn = CheckInMonitor()
     /// AI provider. Features talk to it through the `AIService` protocol, so it can be swapped.
     let ai = GeminiService()
+    let auth = AuthService()
+    /// Admin/business accounts can preview the runner tabs on one phone (local only; Firestore role unchanged).
+    var previewAsRunner = false
+
+    /// The signed-in user's role from Firestore (`users/{uid}.role`).
+    var role: UserRole {
+        previewAsRunner ? .runner : (auth.profile?.role ?? .runner)
+    }
+    let recommendations = RecommendationEngine()
+    let suggestions = InterestSuggestionEngine()
+    let narration = NarrationEngine()
+    @ObservationIgnored private var isPickingSuggestion = false
 
     /// The location the app is using right now: real GPS, or simulated in Demo Mode.
     private(set) var currentLocation: CLLocation?
@@ -67,8 +79,8 @@ final class AppState {
     @ObservationIgnored private var routeTask: Task<Void, Never>?
     private(set) var isRerouting = false
 
-    /// IDs (business or real place) the AI recommender picked. Filled in by AI §5.
-    var recommendedIDs: Set<String> = []
+    /// IDs (business or real place) the recommender picked. Drives the ⭐ pins on the map.
+    var recommendedIDs: Set<String> { Set(recommendations.items.map(\.id)) }
     /// IDs of places the user has run to and checked in at (from run history).
     var visitedIDs: Set<String> { history.visitedIDs }
 
@@ -84,8 +96,15 @@ final class AppState {
     @ObservationIgnored private var runQuestID: Quest.ID?
     @ObservationIgnored private var checkedInDestination: PlannedDestination?
 
-    /// The offer currently shown in the in-app banner.
-    private(set) var bannerOffer: QuestOffer?
+    /// The single popup slot (safety > offers > suggestions > narration).
+    let popups = PopupManager()
+    /// Which tab is showing (popups dock on the map when it's the Run tab).
+    var selectedTab: AppTab = .run
+
+    /// Timed offers: when each visible offer runs out, and offers that expired this run (never re-shown).
+    private(set) var offerDeadlines: [Quest.ID: Date] = [:]
+    private(set) var expiredOfferIDs: Set<Quest.ID> = []
+    @ObservationIgnored private var offerTimers: [Quest.ID: Task<Void, Never>] = [:]
     /// Asks the map to fly to a pin (set on Accept and on a surprise pick).
     var mapFocus: MapSelection?
 
@@ -102,12 +121,27 @@ final class AppState {
         demo.onLocation = { [weak self] fix in
             self?.handleLocation(fix)
         }
+        auth.onUserChange = { [weak self] uid in self?.userChanged(uid) }
+        auth.onProfileChange = { [weak self] profile in
+            // One-time upload of old local mock businesses (only business/admin accounts may create them).
+            if profile?.role.canManageBusinesses == true { self?.businessStore.migrateLocalFileIfNeeded() }
+        }
+        businessStore.onChange = { [weak self] in self?.remoteDataChanged() }
+        questStore.onChange = { [weak self] in self?.remoteDataChanged() }
+        popups.onPresent = { [weak self] popup in
+            self?.popupPresented(popup)
+        }
         checkIn.onCheckIn = { [weak self] destination in
             self?.handleCheckIn(at: destination)
         }
         crossings.onAlert = { [weak self] point in
-            guard let self, self.preferences.voiceCues else { return }
-            SpeechService.shared.speak(oneOf: point.kind.voiceCues, key: "crossing.\(point.kind.rawValue)")
+            guard let self else { return }
+            // Safety is the top priority: it pre-empts any other popup (and cuts off narration speech).
+            self.popups.show(.safety(point), id: "safety-\(point.id)", autoDismissAfter: 12)
+            if self.preferences.voiceCues {
+                SpeechService.shared.stop()
+                SpeechService.shared.speak(oneOf: point.kind.voiceCues, key: "crossing.\(point.kind.rawValue)")
+            }
         }
     }
 
@@ -124,7 +158,14 @@ final class AppState {
         }
         if run.state == .running, navigation.isNavigating {
             navigation.update(with: fix)
-            if preferences.crossingAlerts { crossings.update(progress: navigation.progress) }
+            if preferences.crossingAlerts {
+                crossings.update(progress: navigation.progress)
+                // The crossing is behind the runner: close its pill.
+                if crossings.activeAlert == nil { popups.remove { if case .safety = $0.content { true } else { false } } }
+            }
+            checkInterestSuggestions()
+            checkNarration()
+            reportQuestETA()
         }
         evaluateOffers()
     }
@@ -144,9 +185,11 @@ final class AppState {
     }
 
     func deleteBusiness(id: Business.ID) {
-        businessStore.delete(id: id)
+        endOffers(for: id, businessName: partner(id: id)?.name)
+        // Quests first: firestore.rules checks quest deletes against the business's owner,
+        // which it can't do once the business document is gone.
         questStore.removeAll(for: id)
-        if bannerOffer?.business.id == id { bannerOffer = nil }
+        businessStore.delete(id: id)
     }
 
     /// Business mode's big switch. Going slow opens an Off-Peak Quest; un-slowing expires it.
@@ -155,8 +198,8 @@ final class AppState {
         if isSlow, let business = partner(id: businessID) {
             questStore.open(for: business)
         } else {
+            endOffers(for: businessID, businessName: partner(id: businessID)?.name)
             questStore.expire(for: businessID)
-            if bannerOffer?.business.id == businessID { bannerOffer = nil }
         }
         evaluateOffers()
     }
@@ -167,7 +210,7 @@ final class AppState {
     var offers: [QuestOffer] {
         guard let here = currentLocation else { return [] }
         return QuestMatcher.offers(
-            quests: questStore.quests.filter { !questStore.dismissedIDs.contains($0.id) },
+            quests: questStore.quests.filter { !questStore.dismissedIDs.contains($0.id) && !expiredOfferIDs.contains($0.id) },
             businesses: partners,
             runner: here,
             plannedDestination: destination?.location,
@@ -180,23 +223,101 @@ final class AppState {
         return (quest, business)
     }
 
-    /// Announces the best new offer: in-app banner, haptic, and a local notification.
-    func evaluateOffers() {
-        // Drop a banner whose quest is no longer offerable.
-        if let shown = bannerOffer, !offers.contains(where: { $0.id == shown.id }) {
-            bannerOffer = nil
+    /// The offer popup currently visible, if any.
+    var visibleOffer: QuestOffer? {
+        if case .offer(let offer) = popups.current?.content { return offer }
+        return nil
+    }
+
+    private static func offerPopupID(_ offer: QuestOffer) -> String { "offer-\(offer.quest.id)" }
+
+    // MARK: Timed offers
+
+    /// An offer popup just became visible: start its countdown (once; it keeps running if a safety
+    /// alert interrupts it), tell the business it was shown, and announce it for VoiceOver.
+    private func popupPresented(_ popup: PopupManager.Popup) {
+        // Narration is spoken only when it actually appears (never while waiting behind other popups).
+        if case .narration(let line) = popup.content {
+            if preferences.narrationVoice && preferences.voiceCues {
+                SpeechService.shared.speak(line.text, style: .narration)
+            }
+            VoiceOver.announce(line.text)
+            return
         }
-        guard bannerOffer == nil, acceptedQuest == nil,
+        guard case .offer(let offer) = popup.content, offerDeadlines[offer.quest.id] == nil else { return }
+        let id = offer.quest.id
+        offerDeadlines[id] = .now.addingTimeInterval(OfferTiming.countdown)
+        questStore.recordOffer(.shown, for: id)
+        VoiceOver.announce("Off-Peak Quest: \(offer.quest.reward) at \(offer.business.name). \(Int(OfferTiming.countdown)) seconds to accept.")
+
+        offerTimers[id] = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(OfferTiming.countdown - OfferTiming.warningAt))
+            guard !Task.isCancelled, let self else { return }
+            if case .offer(let shown) = self.popups.current?.content, shown.quest.id == id {
+                Haptics.light()
+                VoiceOver.announce("\(Int(OfferTiming.warningAt)) seconds left to accept.")
+            }
+            try? await Task.sleep(for: .seconds(OfferTiming.warningAt))
+            guard !Task.isCancelled else { return }
+            self.expireOffer(offer)
+        }
+    }
+
+    /// Time's up: the popup animates away and the offer won't come back this run.
+    private func expireOffer(_ offer: QuestOffer) {
+        let id = offer.quest.id
+        stopOfferTimer(id)
+        expiredOfferIDs.insert(id)
+        questStore.recordOffer(.expired, for: id)
+        popups.dismiss(id: Self.offerPopupID(offer))
+        VoiceOver.announce("Offer expired.")
+    }
+
+    private func stopOfferTimer(_ id: Quest.ID) {
+        offerTimers[id]?.cancel()
+        offerTimers[id] = nil
+    }
+
+    func offerDeadline(for questID: Quest.ID) -> Date? { offerDeadlines[questID] }
+
+    /// The business ended its promotion: close its offer, with a short "Offer ended" note if it was visible.
+    private func endOffers(for businessID: Business.ID, businessName: String?) {
+        if let visible = visibleOffer, visible.business.id == businessID {
+            stopOfferTimer(visible.quest.id)
+            popups.dismiss(id: Self.offerPopupID(visible))
+            popups.show(.info(.init(title: "Offer ended", message: "\(businessName ?? "The business") is busy again. Maybe next time!",
+                                    symbol: "clock.badge.xmark")),
+                        id: "ended-\(visible.quest.id)", autoDismissAfter: 3)
+            VoiceOver.announce("Offer ended.")
+        }
+        removeOfferPopups(for: businessID)
+    }
+
+    private func removeOfferPopups(for businessID: Business.ID) {
+        popups.remove { if case .offer(let o) = $0.content { o.business.id == businessID } else { false } }
+    }
+
+    /// Announces the best new offer through the popup queue (plus haptic and a local notification).
+    /// Runners only; one offer queued at a time.
+    func evaluateOffers() {
+        // Drop offer popups whose quest is no longer offerable.
+        let live = Set(offers.map(\.id))
+        popups.remove { if case .offer(let o) = $0.content { !live.contains(o.id) } else { false } }
+
+        let offerQueued = popups.contains { if case .offer = $0.content { true } else { false } }
+        guard role == .runner, !offerQueued, acceptedQuest == nil,
               let next = offers.first(where: { !announcedQuestIDs.contains($0.id) }) else { return }
         announcedQuestIDs.insert(next.id)
-        bannerOffer = next
+        popups.show(.offer(next), id: Self.offerPopupID(next))
         Haptics.success()
         NotificationService.notifyQuestOffer(next)
     }
 
     func accept(_ offer: QuestOffer) {
+        stopOfferTimer(offer.quest.id)
+        questStore.recordOffer(.accepted, for: offer.quest.id)
         questStore.accept(offer.quest.id)
-        bannerOffer = nil
+        popups.dismiss(id: Self.offerPopupID(offer))
         setDestination(PlannedDestination(business: offer.business), note: "Off-Peak Quest")
         mapFocus = .partner(offer.business.id)
         Haptics.tap()
@@ -208,8 +329,10 @@ final class AppState {
     }
 
     func dismiss(_ offer: QuestOffer) {
+        stopOfferTimer(offer.quest.id)
+        questStore.recordOffer(.dismissed, for: offer.quest.id)
         questStore.dismiss(offer.quest.id)
-        bannerOffer = nil
+        popups.dismiss(id: Self.offerPopupID(offer))
         evaluateOffers()
     }
 
@@ -342,6 +465,8 @@ final class AppState {
                                                          transport: plan.activity.transportType) {
                 navigation.start(option)
                 prepareCrossings()
+                suggestions.routeChanged(option)
+                narration.routeChanged(option)
                 if let arrival = option.destinationArrival {
                     checkIn.arrivalPoint = CLLocation(latitude: arrival.latitude, longitude: arrival.longitude)
                 }
@@ -397,6 +522,10 @@ final class AppState {
             history.saveStamp(Stamp(place: place, runId: runID))
             earnedStamp = true
         }
+        // Tell the business about the visit (verdict only: no health data, no route).
+        if place.isPartner, let uid = auth.uid {
+            Visit.record(businessId: place.id, runnerUid: uid, questId: runQuestID, verification: verification)
+        }
         celebration = CheckInEvent(destination: place, reward: unlocked, lockedReward: locked,
                                    verification: verification, isFirstVisit: isFirstVisit, earnedStamp: earnedStamp)
         verification.passed ? Haptics.success() : Haptics.error()
@@ -431,7 +560,7 @@ final class AppState {
     func choose(_ match: DestinationMatch, note: String? = nil) {
         if let questID = match.questID {
             questStore.accept(questID)
-            bannerOffer = nil
+            removeOfferPopups(for: match.destination.id)
         }
         setDestination(match.destination, note: note ?? (match.hasQuest ? "Off-Peak Quest" : "Fits your goal"))
         mapFocus = match.destination.isPartner ? .partner(match.id) : .place(match.id)
@@ -455,7 +584,26 @@ final class AppState {
     /// Looks up a real place by id in the nearby cache or in the destination results
     /// (ring searches can find places outside the nearby cache).
     func realPlace(id: RealPlace.ID) -> RealPlace? {
-        places.place(id: id) ?? finder.match(id: id)?.realPlace
+        places.place(id: id) ?? finder.match(id: id)?.realPlace ?? recommendations.recommendation(id: id)?.realPlace
+    }
+
+    // MARK: Recommendations
+
+    /// Refreshes "Suggested for you" when stale (3 h), after a new visit, or when forced.
+    func refreshRecommendations(force: Bool = false) {
+        guard let here = currentLocation else { return }
+        let plan = planStore.lastPlan
+        let context = RecommendationEngine.Context(
+            here: here, partners: partners,
+            liveQuestReward: { [questStore, businessStore] id in
+                guard businessStore.business(id: id)?.isSlow == true,
+                      let quest = questStore.openQuest(for: id), quest.status == .active else { return nil }
+                return quest.reward
+            },
+            nearbyPlaces: places.places, runs: history.runs(),
+            saved: history.savedPlaces(), interests: preferences.interests,
+            plan: plan, target: targetDistance(for: plan))
+        if force { recommendations.refresh(context, ai: ai) } else { recommendations.refreshIfNeeded(context, ai: ai) }
     }
 
     // MARK: Map presentation
@@ -532,6 +680,17 @@ final class AppState {
             prepareCrossings()   // no-op if already fetched while the route was selected
             routeOptions = []
             if playback { startDemoPlayback(along: route, plan: plan) }
+            if preferences.narration {
+                narration.prepare(route: route, interests: preferences.interests, partners: partners,
+                                  nearbyPlaces: places.places, ai: ai, demoMode: playback)
+            }
+            if preferences.runSuggestions {
+                suggestions.prepare(route: route, interests: preferences.interests, partners: partners,
+                                    hasLivePromotion: { [questStore, businessStore] id in
+                                        businessStore.business(id: id)?.isSlow == true && questStore.openQuest(for: id) != nil
+                                    },
+                                    nearbyPlaces: places.places, excludeID: destination?.id, demoMode: playback)
+            }
         }
         location.setBackgroundTracking(true)
         // Ask for permissions at the moment they matter: when a run actually starts.
@@ -556,6 +715,14 @@ final class AppState {
         demo.stop()
         navigation.stop()
         crossings.reset()
+        suggestions.reset()
+        narration.reset()
+        popups.remove {
+            switch $0.content {
+            case .suggestion, .narration: true
+            default: false
+            }
+        }
         motion.stop()
         checkIn.stop()
         location.setBackgroundTracking(false)
@@ -602,7 +769,138 @@ final class AppState {
         activePlan = nil
         lastFinishedRun = nil
         isFakeCarRun = false
+        expiredOfferIDs = []   // "expired for this run": a new run may offer it again
+        offerDeadlines = [:]
         if acceptedQuest == nil { clearDestination() }
+    }
+
+    // MARK: Accounts and live sync
+
+    /// Sign-in starts the live Firestore listeners and the history merge; sign-out stops them.
+    private func userChanged(_ uid: String?) {
+        previewAsRunner = false
+        if let uid {
+            businessStore.start(uid: uid)
+            questStore.start(uid: uid)
+            Task { await history.attach(uid: uid) }
+        } else {
+            if run.isActive { endRun() }
+            resetRun()
+            businessStore.stop()
+            questStore.stop()
+            history.detach()
+            popups.remove { _ in true }
+            announcedQuestIDs = []
+        }
+    }
+
+    /// A business or quest changed (possibly on another phone): re-check offers, and if the business
+    /// behind the visible offer stopped its promotion, close it with "Offer ended".
+    private func remoteDataChanged() {
+        if let visible = visibleOffer {
+            let business = partner(id: visible.business.id)
+            let quest = questStore.quests.first { $0.id == visible.quest.id }
+            if business?.isSlow != true || quest?.status != .active {
+                endOffers(for: visible.business.id, businessName: business?.name ?? visible.business.name)
+            }
+        }
+        evaluateOffers()
+    }
+
+    /// While heading to an accepted quest, send a live ETA (every 15 s) for the business dashboard.
+    @ObservationIgnored private var lastETAReport: Date = .distantPast
+    private func reportQuestETA() {
+        guard let accepted = acceptedQuest, destination?.id == accepted.business.id,
+              let route = navigation.route, !navigation.reachedDestination,
+              Date.now.timeIntervalSince(lastETAReport) >= 15 else { return }
+        lastETAReport = .now
+        let remaining = max(0, route.destinationDistance - navigation.progress)
+        // Live pace already reflects Demo playback speed; the plan's usual pace needs scaling.
+        let timeScale = (demo.isPlaying && !isFakeCarRun) ? developer.demoSpeed : 1
+        let pace = run.currentPace
+            ?? planStore.pace(for: (activePlan ?? planForRouting).activity).secondsPerMeter / timeScale
+        questStore.updateETA(remaining * pace, for: accepted.quest.id)
+    }
+
+    // MARK: Quick-stop suggestions (interest matches along the route)
+
+    /// Called on every navigating fix. Removes suggestions the runner has passed, then (at most one
+    /// at a time, respecting the 3-minute cooldown) asks the writer to pick and phrase the next one.
+    private func checkInterestSuggestions() {
+        let progress = navigation.progress
+        popups.remove { if case .suggestion(let s) = $0.content { progress > s.alongRoute + 15 } else { false } }
+        guard preferences.runSuggestions, role == .runner, run.state == .running, !isPickingSuggestion,
+              !popups.contains(where: { if case .suggestion = $0.content { true } else { false } }) else { return }
+
+        let timeScale = (demo.isPlaying && !isFakeCarRun) ? developer.demoSpeed : 1
+        let eligible = suggestions.eligible(progress: progress, timeScale: timeScale)
+        guard !eligible.isEmpty else { return }
+
+        isPickingSuggestion = true
+        Task {
+            let pick = await SuggestionWriter.pick(from: eligible, progress: progress,
+                                                   interests: preferences.interests, ai: ai)
+            isPickingSuggestion = false
+            guard let pick, run.state == .running, navigation.progress < pick.alongRoute else { return }
+            suggestions.markSuggested(pick.id)
+            popups.show(.suggestion(pick), id: "suggest-\(pick.id)", expiresIn: 120)
+            Haptics.light()
+            VoiceOver.announce(pick.message)
+        }
+    }
+
+    // MARK: City-guide narration
+
+    /// Queues the next narration when one is due. Lowest popup priority; waits up to 30 s behind
+    /// other popups, then is dropped (the place has been passed by then).
+    private func checkNarration() {
+        guard preferences.narration, role == .runner, run.state == .running else { return }
+        let timeScale = (demo.isPlaying && !isFakeCarRun) ? developer.demoSpeed : 1
+        guard let line = narration.due(progress: navigation.progress, timeScale: timeScale) else { return }
+        popups.show(.narration(line), id: "narration-\(line.id)", expiresIn: 30,
+                    autoDismissAfter: line.destination == nil ? 10 : 15)
+    }
+
+    /// "Add stop": route through the place, then carry on with the rest of the plan.
+    func addStop(_ suggestion: InterestSuggestion) {
+        popups.dismiss(id: "suggest-\(suggestion.id)")
+        guard let here = currentLocation?.coordinate, !isRerouting else { return }
+        let plan = activePlan ?? planForRouting
+        let headingOut = navigation.isNavigating && !navigation.reachedDestination && destination != nil
+        var points = [here, suggestion.destination.coordinate]
+        if headingOut, let destination { points.append(destination.coordinate) }
+        if plan.shape == .outAndBack, let runStart { points.append(runStart) }
+        let destinationLeg = headingOut ? 1 : 0
+        let name = headingOut ? (destination?.name ?? suggestion.destination.name) : suggestion.destination.name
+
+        isRerouting = true
+        Haptics.success()
+        Task {
+            if let option = await routeGenerator.route(through: points, transport: plan.activity.transportType,
+                                                       title: "With stop", kind: .reroute,
+                                                       waypoints: [suggestion.destination.coordinate],
+                                                       destinationLegIndex: destinationLeg, destinationName: name) {
+                navigation.start(option)
+                prepareCrossings()
+                suggestions.routeChanged(option)
+                narration.routeChanged(option)
+                if headingOut, let arrival = option.destinationArrival {
+                    checkIn.arrivalPoint = CLLocation(latitude: arrival.latitude, longitude: arrival.longitude)
+                }
+                if demo.isPlaying || developer.demoMode || isFakeCarRun { startDemoPlayback(along: option, plan: plan) }
+            }
+            isRerouting = false
+        }
+    }
+
+    func saveSuggestion(_ suggestion: InterestSuggestion) {
+        history.savePlace(suggestion.destination, source: .runSuggestion)
+        Haptics.success()
+        popups.dismiss(id: "suggest-\(suggestion.id)")
+    }
+
+    func dismissSuggestion(_ suggestion: InterestSuggestion) {
+        popups.dismiss(id: "suggest-\(suggestion.id)")
     }
 
     // MARK: Future Places

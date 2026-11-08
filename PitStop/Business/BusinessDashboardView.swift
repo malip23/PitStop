@@ -144,16 +144,82 @@ struct BusinessDashboardView: View {
                 case .accepted:
                     Label("A runner accepted. They're on the way!", systemImage: "figure.run")
                         .foregroundStyle(.green)
+                    if let quest, let eta = quest.etaSeconds, let updated = quest.etaUpdatedAt {
+                        // Live countdown from the runner's last ETA report.
+                        TimelineView(.periodic(from: .now, by: 1)) { context in
+                            let left = max(0, updated.addingTimeInterval(eta).timeIntervalSince(context.date))
+                            Label(left < 30 ? "Runner arriving now" : "Runner arriving in \(Format.duration(left))",
+                                  systemImage: "timer")
+                                .font(.title3.weight(.bold).monospacedDigit())
+                                .foregroundStyle(Theme.coral)
+                                .contentTransition(.numericText(countsDown: true))
+                        }
+                    }
                 case .active:
                     Label("Live. Waiting for a runner to accept.", systemImage: "antenna.radiowaves.left.and.right")
                         .foregroundStyle(Color.accentColor)
                 default:
                     Text("No active quest.").foregroundStyle(.secondary)
                 }
+                if let stats = quest?.offerStats {
+                    offerActivity(stats)
+                }
                 Text("\(visits) quest visit\(visits == 1 ? "" : "s") in the last 30 days")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                RecentVisitsList(businessID: business.id)
             }
+        }
+    }
+
+    /// What happened to the timed (\(Int(OfferTiming.countdown)) s) offer popups runners saw.
+    private func offerActivity(_ stats: OfferStats) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if let outcome = stats.lastOutcome, let at = stats.lastOutcomeAt {
+                Label(lastOutcomeText(outcome, at: at), systemImage: outcomeSymbol(outcome))
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(outcomeColor(outcome))
+            }
+            HStack(spacing: 14) {
+                Label("\(stats.shown) shown", systemImage: "eye")
+                Label("\(stats.accepted) accepted", systemImage: "checkmark.circle")
+                Label("\(stats.expired) expired", systemImage: "timer")
+                Label("\(stats.dismissed) passed", systemImage: "xmark.circle")
+            }
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(.secondary)
+            .labelStyle(.titleAndIcon)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private func lastOutcomeText(_ outcome: OfferStats.Outcome, at date: Date) -> String {
+        let time = date.formatted(date: .omitted, time: .shortened)
+        switch outcome {
+        case .shown: return "Offer showing to a runner now (\(time))"
+        case .accepted: return "Offer accepted at \(time)"
+        case .expired: return "Offer expired at \(time): no answer in \(Int(OfferTiming.countdown)) s"
+        case .dismissed: return "Runner passed at \(time)"
+        }
+    }
+
+    private func outcomeSymbol(_ outcome: OfferStats.Outcome) -> String {
+        switch outcome {
+        case .shown: "eye.fill"
+        case .accepted: "checkmark.circle.fill"
+        case .expired: "timer"
+        case .dismissed: "xmark.circle.fill"
+        }
+    }
+
+    private func outcomeColor(_ outcome: OfferStats.Outcome) -> Color {
+        switch outcome {
+        case .shown: Theme.sky
+        case .accepted: .green
+        case .expired: .orange
+        case .dismissed: .secondary
         }
     }
 

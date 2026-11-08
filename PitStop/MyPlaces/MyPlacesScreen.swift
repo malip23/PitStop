@@ -40,6 +40,11 @@ struct MyPlacesScreen: View {
     private func list(_ visited: [VisitedPlace]) -> some View {
         List {
             Section {
+                SuggestedForYouView(onPlan: onPlanRun)
+            }
+            .onAppear { app.refreshRecommendations() }
+
+            Section {
                 if visited.isEmpty {
                     emptyRow("No visits yet", "Run to a destination and stay 10 seconds to check in.", "figure.run")
                 }

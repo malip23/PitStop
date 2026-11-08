@@ -10,6 +10,14 @@ struct RunMapScreen: View {
     @State private var showPlanSheet = false
     @State private var showLegend = false
     @State private var showQuests = false
+    @State private var showSuggestions = false
+    @State private var questsDetent: PresentationDetent = .medium
+    /// Measured heights of the top and bottom overlays and the map, used to keep the route and
+    /// the user marker in the visible gap between them.
+    @State private var topInset: CGFloat = 0
+    @State private var bottomInset: CGFloat = 0
+    @State private var mapHeight: CGFloat = 800
+    @State private var lastFramedInset: CGFloat = 0
     /// Last camera the map reported. Lets animations keep the current zoom, rotation, and pitch.
     @State private var lastCamera: MapCamera?
     /// Set when code (not a tap) changes the selection, so we don't also re-center on the pin.
@@ -101,6 +109,10 @@ struct RunMapScreen: View {
                 .annotationTitles(.hidden)
             }
         }
+        .background(GeometryReader { geo in
+            Color.clear.onAppear { mapHeight = geo.size.height }
+                .onChange(of: geo.size.height) { _, h in mapHeight = h }
+        })
         // Muted base map without Apple's POI icons, so our own pins carry the design.
         .mapStyle(.standard(elevation: .realistic, emphasis: .muted, pointsOfInterest: .excludingAll))
         .mapControls {
@@ -124,36 +136,46 @@ struct RunMapScreen: View {
         .onChange(of: app.selectedRouteID) { _, _ in
             if let route = app.selectedRoute { frame(route) }
         }
+        .onChange(of: bottomInset) { _, inset in
+            // A card appeared or grew: re-fit the planned route so it stays above it.
+            guard !app.run.isActive, abs(inset - lastFramedInset) > 40, let route = app.selectedRoute else { return }
+            lastFramedInset = inset
+            frame(route)
+        }
         .overlay(alignment: .topLeading) {
             if !app.navigation.isNavigating {
                 VStack(spacing: 10) {
                     legendButton
-                    if app.developer.role == .runner { questsButton }
-                }
-            }
-        }
-        .overlay(alignment: .top) {
-            if app.navigation.isNavigating {
-                VStack(alignment: .leading, spacing: 8) {
-                    NavigationBanner()
-                    if let alert = app.crossings.activeAlert, app.preferences.crossingAlerts {
-                        CrossingAlertBanner(point: alert,
-                                            distance: max(0, alert.distanceAlongRoute - app.navigation.progress))
-                            .transition(.move(edge: .top).combined(with: .opacity))
+                    if app.role == .runner {
+                        questsButton
+                        suggestionsButton
                     }
-                    followButton
                 }
-                .animation(.spring(duration: 0.35), value: app.crossings.activeAlert?.id)
-                .padding(.horizontal)
-                .padding(.top, 4)
-                .transition(.move(edge: .top).combined(with: .opacity))
-            } else {
-                searchStatus
             }
         }
-        .animation(.snappy, value: app.navigation.isNavigating)
+        // Top: one compact navigation row, then the top popup slot (safety / narration pills).
+        .safeAreaInset(edge: .top) {
+            VStack(spacing: 6) {
+                if app.navigation.isNavigating {
+                    NavigationBanner(followRunner: $followRunner)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                } else {
+                    searchStatus
+                }
+                if app.selectedTab == .run {
+                    PopupHost(placement: .top)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 2)
+            .animation(.snappy, value: app.navigation.isNavigating)
+            .measureHeight { topInset = $0 }
+        }
         .safeAreaInset(edge: .bottom) {
-            VStack(spacing: 10) {
+            VStack(spacing: 8) {
+                if app.selectedTab == .run {
+                    PopupHost(placement: .bottom)
+                }
                 selectionCard
                 if app.navigation.isNavigating {
                     // The navigation banner covers destination info during the run.
@@ -178,8 +200,9 @@ struct RunMapScreen: View {
                 }
                 RunStatsCard { showPlanSheet = true }
             }
-            .padding(.horizontal)
-            .padding(.bottom, 8)
+            .padding(.horizontal, 12)
+            .padding(.bottom, 6)
+            .measureHeight { bottomInset = $0 }
             .animation(.snappy, value: selection)
             .animation(.snappy, value: app.acceptedQuest?.quest.id)
             .animation(.snappy, value: app.destination?.id)
@@ -192,9 +215,19 @@ struct RunMapScreen: View {
         .sheet(isPresented: $showLegend) {
             MapLegendSheet()
         }
+        .sheet(isPresented: $showSuggestions) {
+            SuggestionsSheet(compact: app.run.isActive)
+        }
+        .onChange(of: app.currentLocation == nil) { _, _ in app.refreshRecommendations() }
         .sheet(isPresented: $showQuests) {
             QuestsScreen(onAccepted: { showQuests = false })
-                .presentationDetents([.medium, .large])
+                .presentationDetents([.height(120), .medium, .large], selection: $questsDetent)
+                .presentationBackgroundInteraction(.enabled(upThrough: .height(120)))
+                .presentationDragIndicator(.visible)
+        }
+        .onChange(of: showQuests) { _, open in
+            // During a run, sheets open at the smallest size so the route stays visible.
+            if open { questsDetent = app.run.isActive ? .height(120) : .medium }
         }
         .onChange(of: app.mapFocus) { _, target in
             guard let target else { return }
@@ -202,53 +235,57 @@ struct RunMapScreen: View {
             app.mapFocus = nil
         }
         .onAppear {
-            if app.location.authorization == .notDetermined {
-                app.location.requestWhenInUse()
-            } else {
+            // During first launch, onboarding asks for location (with context) instead.
+            if app.location.authorization != .notDetermined {
                 app.location.start()
             }
+            app.refreshRecommendations()
         }
     }
 
+    /// Goal matches and recommendations that aren't in the nearby-places cache (de-duplicated).
     private var extraMatchPlaces: [RealPlace] {
-        app.finder.matches.compactMap(\.realPlace).filter { app.places.place(id: $0.id) == nil }
+        var seen = Set(app.places.places.map(\.id))
+        return (app.finder.matches.compactMap(\.realPlace) + app.recommendations.items.compactMap(\.realPlace))
+            .filter { seen.insert($0.id).inserted }
     }
 
     // MARK: Camera
 
-    /// Keeps the runner centered, facing their direction of travel, while navigating.
+    /// Camera center that puts `point` in the middle of the VISIBLE map (between the top and bottom
+    /// overlays) instead of the middle of the screen. "Up" on screen is `heading`, so the camera center
+    /// moves backwards by half the overlay imbalance, converted from points to meters.
+    private func visibleCenter(for point: CLLocationCoordinate2D, heading: Double, distance: Double) -> CLLocationCoordinate2D {
+        let shiftPoints = (bottomInset - topInset) / 2
+        guard abs(shiftPoints) > 4 else { return point }
+        let metersPerPoint = distance * 0.9 / max(mapHeight, 1)   // rough, fine at running zoom levels
+        return point.offset(bearingDegrees: heading + 180, meters: shiftPoints * metersPerPoint)
+    }
+
+    /// Keeps the runner in the visible middle, facing their direction of travel, while navigating.
     private func followCameraIfNeeded() {
         guard app.navigation.isNavigating, followRunner, app.run.state == .running,
               let here = app.currentLocation?.coordinate else { return }
+        let heading = app.userHeading ?? lastCamera?.heading ?? 0
         withAnimation(.linear(duration: 0.9)) {
-            camera = .camera(MapCamera(centerCoordinate: here, distance: 550,
-                                       heading: app.userHeading ?? lastCamera?.heading ?? 0, pitch: 55))
+            camera = .camera(MapCamera(centerCoordinate: visibleCenter(for: here, heading: heading, distance: 550),
+                                       distance: 550, heading: heading, pitch: 50))
         }
     }
 
-    /// Fits a route option on screen when it's selected.
+    /// Fits a route option in the visible area (extra room under the bottom cards and the top bar).
     private func frame(_ route: RouteOption) {
         guard !route.coordinates.isEmpty else { return }
         let rect = MKPolyline(coordinates: route.coordinates, count: route.coordinates.count).boundingMapRect
-        let padded = rect.insetBy(dx: -rect.width * 0.25, dy: -rect.height * 0.45)
+        var padded = rect.insetBy(dx: -rect.width * 0.2, dy: -rect.height * 0.2)
+        let visible = max(mapHeight - topInset - bottomInset, 120)
+        let southExtra = padded.height * Double(bottomInset / visible)
+        let northExtra = padded.height * Double(topInset / visible)
+        padded = MKMapRect(x: padded.origin.x, y: padded.origin.y - northExtra,
+                           width: padded.width, height: padded.height + northExtra + southExtra)
         withAnimation(.smooth(duration: 0.7)) {
             camera = .rect(padded)
         }
-    }
-
-    private var followButton: some View {
-        Button {
-            followRunner.toggle()
-            if followRunner { followCameraIfNeeded() }
-        } label: {
-            Label(followRunner ? "Following" : "Follow me",
-                  systemImage: followRunner ? "location.north.line.fill" : "location.north.line")
-                .font(.caption.weight(.semibold))
-                .padding(.horizontal, 12)
-                .padding(.vertical, 7)
-                .background(.regularMaterial, in: Capsule())
-        }
-        .buttonStyle(.plain)
     }
 
     private func coordinate(of target: MapSelection) -> CLLocationCoordinate2D? {
@@ -267,9 +304,10 @@ struct RunMapScreen: View {
     private func centerCamera(on target: MapSelection) {
         guard let coordinate = coordinate(of: target) else { return }
         let distance = min(lastCamera?.distance ?? 1500, 2500)
+        let heading = lastCamera?.heading ?? 0
         withAnimation(.smooth(duration: 0.6)) {
-            camera = .camera(MapCamera(centerCoordinate: coordinate, distance: distance,
-                                       heading: lastCamera?.heading ?? 0, pitch: lastCamera?.pitch ?? 0))
+            camera = .camera(MapCamera(centerCoordinate: visibleCenter(for: coordinate, heading: heading, distance: distance),
+                                       distance: distance, heading: heading, pitch: lastCamera?.pitch ?? 0))
         }
     }
 
@@ -278,18 +316,20 @@ struct RunMapScreen: View {
     private func cameraForRunStart() {
         guard let here = app.currentLocation?.coordinate else { return }
         guard let destination = app.destination?.coordinate else {
+            let heading = app.userHeading ?? 0
             withAnimation(.easeInOut(duration: 1.2)) {
-                camera = .camera(MapCamera(centerCoordinate: here, distance: 900,
-                                           heading: app.userHeading ?? 0, pitch: 55))
+                camera = .camera(MapCamera(centerCoordinate: visibleCenter(for: here, heading: heading, distance: 900),
+                                           distance: 900, heading: heading, pitch: 50))
             }
             return
         }
         let center = CLLocationCoordinate2D(latitude: (here.latitude + destination.latitude) / 2,
                                             longitude: (here.longitude + destination.longitude) / 2)
+        let distance = max(here.distance(to: destination) * 2.4, 900)
+        let heading = here.bearing(to: destination)
         withAnimation(.easeInOut(duration: 1.2)) {
-            camera = .camera(MapCamera(centerCoordinate: center,
-                                       distance: max(here.distance(to: destination) * 2.4, 900),
-                                       heading: here.bearing(to: destination), pitch: 45))
+            camera = .camera(MapCamera(centerCoordinate: visibleCenter(for: center, heading: heading, distance: distance),
+                                       distance: distance, heading: heading, pitch: 45))
         }
     }
 
@@ -360,6 +400,34 @@ struct RunMapScreen: View {
         }
         .padding(.leading, 12)
         .accessibilityLabel("Off-Peak Quests")
+    }
+
+    /// ✨ opens "Suggested for you" in a short sheet; the badge shows how many.
+    private var suggestionsButton: some View {
+        Button {
+            app.refreshRecommendations()
+            showSuggestions = true
+        } label: {
+            Image(systemName: "sparkles")
+                .font(.system(size: 17, weight: .bold))
+                .foregroundStyle(Theme.sky)
+                .frame(width: 44, height: 44)
+                .background(.regularMaterial, in: Circle())
+                .overlay(alignment: .topTrailing) {
+                    let count = app.recommendations.items.count
+                    if count > 0 {
+                        Text("\(count)")
+                            .font(.caption2.weight(.heavy))
+                            .foregroundStyle(.white)
+                            .frame(minWidth: 18, minHeight: 18)
+                            .background(Theme.sky, in: Circle())
+                            .offset(x: 4, y: -4)
+                    }
+                }
+                .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
+        }
+        .padding(.leading, 12)
+        .accessibilityLabel("Suggested for you")
     }
 
     private var legendButton: some View {

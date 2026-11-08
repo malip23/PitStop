@@ -1,0 +1,33 @@
+import FirebaseFirestore
+import Foundation
+
+/// Firestore `visits/{id}`: a runner checked in at a partner business.
+/// Deliberately minimal: what the business may see. No health data, no routes, no names.
+struct Visit: Codable, Identifiable, Hashable {
+    var id: String = UUID().uuidString
+    var businessId: String
+    var runnerUid: String
+    var questId: String?
+    var verified: Bool
+    var verificationReasons: [String]
+    var timestamp: Date
+
+    /// Records a check-in visit.
+    static func record(businessId: String, runnerUid: String, questId: String?, verification: VerificationResult) {
+        let visit = Visit(businessId: businessId, runnerUid: runnerUid, questId: questId,
+                          verified: verification.passed, verificationReasons: verification.reasons, timestamp: .now)
+        try? Firestore.firestore().collection("visits").document(visit.id).setData(from: visit)
+    }
+
+    /// Live recent visits for one business (the owner's dashboard). Sorted newest first on the device,
+    /// so no composite index is needed.
+    static func listen(businessId: String, onChange: @escaping ([Visit]?) -> Void) -> ListenerRegistration {
+        Firestore.firestore().collection("visits")
+            .whereField("businessId", isEqualTo: businessId)
+            .addSnapshotListener { snapshot, error in
+                guard error == nil, let snapshot else { onChange(nil); return }
+                onChange(snapshot.documents.compactMap { try? $0.data(as: Visit.self) }
+                    .sorted { $0.timestamp > $1.timestamp })
+            }
+    }
+}

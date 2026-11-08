@@ -12,7 +12,6 @@ import Observation
 /// 4. **Simulated location:** any fix with `sourceInformation.isSimulatedBySoftware`
 ///    (e.g. Xcode's Simulate Location or spoofing apps).
 /// 5. **Impossible jumps:** two or more fix-to-fix jumps faster than a human (or bike) can move.
-/// 6. **Heart rate near resting during a "run":** added once HealthKit is wired in.
 ///
 /// Demo Mode compresses time ×N, so all speeds are divided by `timeScale` first, and Demo supplies
 /// matching synthetic steps. The "fake car run" supplies no steps, so it fails like a real cheat would.

@@ -7,4 +7,5 @@ enum Haptics {
     static func warning() { UINotificationFeedbackGenerator().notificationOccurred(.warning) }
     static func error() { UINotificationFeedbackGenerator().notificationOccurred(.error) }
     static func tap() { UIImpactFeedbackGenerator(style: .medium).impactOccurred() }
+    static func light() { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
 }

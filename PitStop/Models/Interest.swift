@@ -1,6 +1,6 @@
 /// Things a runner likes to pass or visit. Used by the AI route agent (scenic choices) and,
 /// later, the recommender.
-enum Interest: String, CaseIterable, Identifiable, Codable, Sendable {
+nonisolated enum Interest: String, CaseIterable, Identifiable, Codable, Sendable {
     case coffee, bakeries, parks, bookstores, smoothies, gyms, vintage, museums, waterfront, streetArt, food, music
 
     var id: Self { self }

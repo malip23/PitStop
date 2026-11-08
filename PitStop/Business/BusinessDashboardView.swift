@@ -18,6 +18,7 @@ struct BusinessDashboardView: View {
                     slowCard(business)
                     rewardCard(business)
                     questStatusCard(business)
+                    DashboardCard { BusinessInsightsCard(business: business) }
                     Label("You'll see visits and arrival times only, never runner health data or routes.",
                           systemImage: "lock.shield")
                         .font(.footnote)

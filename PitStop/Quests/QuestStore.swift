@@ -73,7 +73,8 @@ final class QuestStore {
     /// Business is no longer slow: close any open quest for it.
     func expire(for businessID: String) {
         for quest in quests where quest.businessId == businessID && quest.isOpen {
-            collection.document(quest.id).updateData(["status": Quest.Status.expired.rawValue])
+            collection.document(quest.id).updateData(["status": Quest.Status.expired.rawValue,
+                                                      "endedAt": Timestamp(date: .now)])
         }
     }
 

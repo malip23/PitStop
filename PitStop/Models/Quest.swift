@@ -20,10 +20,18 @@ struct Quest: Identifiable, Codable, Hashable, Sendable {
     var etaUpdatedAt: Date?
     var createdAt: Date = .now
     var completedAt: Date?
+    /// When the business ended the promotion (stopped being slow). Defines the Off-Peak window.
+    var endedAt: Date?
     /// What happened to the timed offer popups for this quest (shown to the business).
     var offerStats: OfferStats?
 
     var isOpen: Bool { status == .active || status == .accepted }
+
+    /// The Off-Peak window this quest covered: from creation until it ended (or now, if still open).
+    var window: DateInterval {
+        let end = endedAt ?? (isOpen ? .now : (completedAt ?? createdAt))
+        return DateInterval(start: createdAt, end: max(end, createdAt))
+    }
 }
 
 /// Outcome counts for a quest's timed offers. Optional on Quest so older saved files still load.

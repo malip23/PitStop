@@ -37,6 +37,9 @@ Built in Swift for iPhone (iOS 17+), with Apple frameworks, Google Gemini, OpenS
 - Create a business (or link to a real one on the map), set a reward, and flip **We're slow right now**.
 - Watch it work live: offers shown / accepted / expired, **"Runner arriving in 3:42"** with a countdown,
   and **recent check-ins** marked verified or not.
+- **See the impact** (Swift Charts): verified check-ins by hour (today) or by day (7 days) with the
+  business's Off-Peak windows shaded behind them, "check-ins during Off-Peak" and offer acceptance rate,
+  and an **offers shown → accepted → visited** funnel with conversion at each step.
 - Businesses only ever see visits, quests, and arrival times, **never runner health data, routes, or names.**
 
 ### For admins

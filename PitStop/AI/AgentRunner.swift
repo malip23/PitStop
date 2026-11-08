@@ -106,6 +106,8 @@ extension AIService {
 func withAIFallback<T>(_ ai: () async throws -> T, fallback: () -> T) async -> (value: T, usedAI: Bool, error: AIError?) {
     do {
         return (try await ai(), true, nil)
+    } catch is CancellationError {
+        return (fallback(), false, nil)          // cancelled because the user moved on: no "AI unavailable" note
     } catch {
         return (fallback(), false, error as? AIError ?? .invalidResponse)
     }

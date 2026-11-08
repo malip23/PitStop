@@ -13,13 +13,18 @@ enum AIConfig {
 
         var models: [String] {
             switch self {
-            case .planning: ["gemini-3.8-flash", "gemini-3.6-flash"]
+            // Flash-Lite is the last resort: it supports function calling and answers fast,
+            // so a slow or unavailable Flash model never costs the user the AI route.
+            case .planning: ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]
             case .narration: ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
             }
         }
 
         /// Gemini 3 thinking level: a little reasoning for agents, as little as possible for narration.
         var thinkingLevel: String { self == .planning ? "low" : "minimal" }
+
+        /// Per-request timeout. Planning models "think" before answering, so they get longer.
+        var timeout: TimeInterval { self == .planning ? 45 : 20 }
 
         /// Client-side throttle: minimum seconds between calls (stays well under free-tier RPM).
         var minInterval: TimeInterval { self == .planning ? 4 : 2 }
@@ -32,7 +37,7 @@ enum AIConfig {
     static let maxAgentIterations = 5
     /// Upper bound on a 429 backoff before giving up and falling back.
     static let maxBackoff: TimeInterval = 8
-    static let requestTimeout: TimeInterval = 25
+    static let requestTimeout: TimeInterval = 45
 
     static let directBaseURL = URL(string: "https://generativelanguage.googleapis.com/v1beta")!
 

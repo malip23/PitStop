@@ -74,6 +74,7 @@ enum AIError: LocalizedError, Equatable {
     case badJSON(String)
     case tooManyToolCalls
     case offline
+    case timedOut(model: String)
 
     var errorDescription: String? {
         switch self {
@@ -86,6 +87,7 @@ enum AIError: LocalizedError, Equatable {
         case .badJSON(let detail): "AI returned invalid JSON (\(detail))."
         case .tooManyToolCalls: "AI agent didn't finish within 5 steps."
         case .offline: "No internet connection."
+        case .timedOut(let model): "AI didn't reply in time (last tried \(model))."
         }
     }
 
@@ -95,6 +97,7 @@ enum AIError: LocalizedError, Equatable {
         case .notConfigured: "AI unavailable: not configured"
         case .rateLimited, .dailyLimitReached: "AI unavailable: rate limit, using standard picks"
         case .offline: "AI unavailable: offline"
+        case .timedOut: "AI took too long, using standard picks"
         default: "AI unavailable, using standard picks"
         }
     }

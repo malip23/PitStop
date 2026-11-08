@@ -173,6 +173,17 @@ extension SettingsScreen {
                     .background(Theme.coral.opacity(0.15), in: Capsule())
                     .foregroundStyle(Theme.coral)
             }
+            if let problem = app.auth.profileProblem {
+                Label(problem, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+            if let uid = app.auth.uid {
+                // Matches the users/{uid} document ID in Firestore (handy when setting a role by hand).
+                LabeledContent("User ID") {
+                    Text(uid).font(.caption2.monospaced()).textSelection(.enabled)
+                }
+            }
             if app.auth.profile?.role.canManageBusinesses == true {
                 Toggle(isOn: $app.previewAsRunner) {
                     Label("Preview as runner", systemImage: "eye")

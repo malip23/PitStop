@@ -1,4 +1,4 @@
-    import SwiftData
+import SwiftData
 import SwiftUI
 
 /// Rewards tab, in three clearly separate groups:

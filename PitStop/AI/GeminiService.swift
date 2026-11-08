@@ -67,8 +67,17 @@ final class GeminiService: AIService {
             return response
         } catch let error as AIError {
             throw fail(error)
+        } catch is CancellationError {
+            throw CancellationError()            // the caller moved on; not an AI failure
+        } catch let urlError as URLError where urlError.code == .cancelled {
+            throw CancellationError()
+        } catch let urlError as URLError {
+            // Keep the real reason (e.g. "A server with the specified hostname could not be found"
+            // when the Worker host is wrong) so Settings → AI can show it.
+            if urlError.code == .notConnectedToInternet { throw fail(.offline) }
+            throw fail(.http(status: 0, message: urlError.localizedDescription))
         } catch {
-            throw fail((error as? URLError)?.code == .notConnectedToInternet ? .offline : .invalidResponse)
+            throw fail(.http(status: 0, message: error.localizedDescription))
         }
     }
 
@@ -109,6 +118,11 @@ final class GeminiService: AIService {
                 } catch AIError.http(let status, let message) where status == 404 || status >= 500 {
                     lastFailure = .http(status: status, message: message)
                     break                            // model missing or server trouble → fallback model
+                } catch let urlError as URLError where urlError.code == .timedOut || urlError.code == .networkConnectionLost {
+                    // No reply in time (a "thinking" model can be slow on busy free-tier days):
+                    // try the next, faster model instead of giving up.
+                    lastFailure = .timedOut(model: model)
+                    break
                 }
             }
         }
@@ -130,6 +144,7 @@ final class GeminiService: AIService {
         case .unavailable:
             throw AIError.notConfigured
         }
+        urlRequest.timeoutInterval = request.task.timeout
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         urlRequest.httpBody = try JSONEncoder().encode(

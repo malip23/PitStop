@@ -16,6 +16,8 @@ final class AuthService {
     private(set) var state: State = .loading
     private(set) var uid: String?
     private(set) var profile: UserProfile?
+    /// Why the profile couldn't be loaded (shown in Settings → Account), e.g. rules not published.
+    private(set) var profileProblem: String?
     private(set) var errorMessage: String?
     private(set) var infoMessage: String?
     private(set) var isWorking = false
@@ -101,16 +103,51 @@ final class AuthService {
         touchLastActive()
 
         // Live profile: role changes apply immediately. Missing doc (e.g. created in the console) → create it.
-        profileListener = db.collection("users").document(user.uid).addSnapshotListener { [weak self] snapshot, _ in
-            guard let self, let snapshot else { return }
+        profileListener = db.collection("users").document(user.uid).addSnapshotListener { [weak self] snapshot, error in
+            guard let self else { return }
+            if let error {
+                self.profileProblem = Self.explain(profileError: error)
+                return
+            }
+            guard let snapshot else { return }
+            self.profileProblem = nil
             if snapshot.exists {
-                self.profile = try? snapshot.data(as: UserProfile.self)
+                self.profile = (try? snapshot.data(as: UserProfile.self)) ?? Self.lenientProfile(snapshot, user: user)
                 self.onProfileChange?(self.profile)
             } else if !snapshot.metadata.isFromCache {
                 try? self.createProfile(uid: user.uid,
                                         name: self.pendingName ?? user.displayName ?? user.email?.components(separatedBy: "@").first ?? "Runner",
                                         email: user.email ?? "")
             }
+        }
+    }
+
+    /// Reads a profile edited by hand in the Firebase console, where it's easy to type "Admin",
+    /// skip a field, or store a date as text. Strict decoding would fail and silently make the user
+    /// a runner; this accepts whatever is there and fills sensible defaults.
+    private static func lenientProfile(_ snapshot: DocumentSnapshot, user: User) -> UserProfile {
+        let data = snapshot.data() ?? [:]
+        func date(_ key: String) -> Date { (data[key] as? Timestamp)?.dateValue() ?? .now }
+        let roleText = (data["role"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        var profile = UserProfile(displayName: data["displayName"] as? String ?? user.email?.components(separatedBy: "@").first ?? "Runner",
+                                  email: data["email"] as? String ?? user.email ?? "",
+                                  role: UserRole(rawValue: roleText) ?? .runner,
+                                  createdAt: date("createdAt"),
+                                  lastActiveAt: date("lastActiveAt"),
+                                  linkedBusinessId: data["linkedBusinessId"] as? String)
+        profile.id = snapshot.documentID
+        return profile
+    }
+
+    private static func explain(profileError error: Error) -> String {
+        let code = FirestoreErrorCode.Code(rawValue: (error as NSError).code)
+        switch code {
+        case .permissionDenied:
+            return "Can't read your profile: publish firestore.rules in Firebase → Firestore → Rules."
+        case .notFound:
+            return "No Firestore database yet: create one in the Firebase console (ID \"(default)\")."
+        default:
+            return "Can't load your profile: \(error.localizedDescription)"
         }
     }
 

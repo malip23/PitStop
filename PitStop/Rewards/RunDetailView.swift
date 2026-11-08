@@ -4,6 +4,7 @@ import SwiftUI
 /// One past run: its route on a map, stats, and the anti-cheat verdict.
 struct RunDetailView: View {
     let run: RunRecord
+    @State private var sharing = false
 
     var body: some View {
         ScrollView {
@@ -60,6 +61,11 @@ struct RunDetailView: View {
         .background(Color(.systemGroupedBackground))
         .navigationTitle(run.destinationName ?? run.date.formatted(date: .abbreviated, time: .omitted))
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            Button { sharing = true } label: { Image(systemName: "square.and.arrow.up") }
+                .accessibilityLabel("Share run")
+        }
+        .sheet(isPresented: $sharing) { ShareRunSheet(run: run) }
     }
 
     private func stat(_ title: String, _ value: String, _ symbol: String) -> some View {

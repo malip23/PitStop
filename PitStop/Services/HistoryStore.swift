@@ -92,6 +92,15 @@ final class HistoryStore {
         cloud?.upload(reward)
     }
 
+    /// The stamp and partner reward earned on a given run (for the share card).
+    func stamp(forRun runID: String) -> Stamp? {
+        try? context.fetch(FetchDescriptor<Stamp>(predicate: #Predicate { $0.runId == runID })).first
+    }
+
+    func reward(forRun runID: String) -> EarnedReward? {
+        try? context.fetch(FetchDescriptor<EarnedReward>(predicate: #Predicate { $0.runId == runID })).first
+    }
+
     // MARK: Stamps & badges
 
     func hasStamp(for placeID: String) -> Bool {

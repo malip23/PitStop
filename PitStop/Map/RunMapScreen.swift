@@ -24,6 +24,10 @@ struct RunMapScreen: View {
     @State private var skipSelectionCamera = false
     /// While navigating, the camera follows the runner (toggle with the follow button).
     @State private var followRunner = true
+    /// 0–1: how much of the selected route is drawn (animates when a route is selected).
+    @State private var routeReveal: Double = 1
+    @State private var revealTask: Task<Void, Never>?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         Map(position: $camera, selection: $selection) {
@@ -48,7 +52,21 @@ struct RunMapScreen: View {
                         .stroke(Theme.coral.opacity(0.35), style: StrokeStyle(lineWidth: 5, lineCap: .round, lineJoin: .round))
                 }
                 if let selected = app.selectedRoute {
-                    GlowingRoute(coordinates: selected.coordinates)
+                    // The selected route "draws itself" from start to destination.
+                    let drawn = selected.coordinates.prefix(fraction: routeReveal)
+                    if drawn.count > 1 {
+                        GlowingRoute(coordinates: drawn)
+                    }
+                    if routeReveal < 1, let head = drawn.last {
+                        Annotation("", coordinate: head) {
+                            Circle()
+                                .fill(Theme.coral)
+                                .frame(width: 12, height: 12)
+                                .overlay(Circle().stroke(.white, lineWidth: 2.5))
+                                .shadow(color: Theme.coral.opacity(0.8), radius: 6)
+                        }
+                        .annotationTitles(.hidden)
+                    }
                 } else if let destination = app.destination, let here = app.currentLocation {
                     // While routes load: a dashed line toward the destination.
                     MapPolyline(coordinates: [here.coordinate, destination.coordinate])
@@ -134,7 +152,10 @@ struct RunMapScreen: View {
             followCameraIfNeeded()
         }
         .onChange(of: app.selectedRouteID) { _, _ in
-            if let route = app.selectedRoute { frame(route) }
+            if let route = app.selectedRoute {
+                frame(route)
+                animateRouteReveal()
+            }
         }
         .onChange(of: bottomInset) { _, inset in
             // A card appeared or grew: re-fit the planned route so it stays above it.
@@ -248,6 +269,29 @@ struct RunMapScreen: View {
         var seen = Set(app.places.places.map(\.id))
         return (app.finder.matches.compactMap(\.realPlace) + app.recommendations.items.compactMap(\.realPlace))
             .filter { seen.insert($0.id).inserted }
+    }
+
+    // MARK: Route drawing animation
+
+    /// Grows the selected route from 0 to 100% over ~0.9 s with an ease-out curve.
+    /// Reduce Motion: the route appears at once.
+    private func animateRouteReveal() {
+        revealTask?.cancel()
+        guard !reduceMotion else {
+            routeReveal = 1
+            return
+        }
+        routeReveal = 0
+        revealTask = Task {
+            let duration = 0.9
+            let start = Date.now
+            while !Task.isCancelled {
+                let t = min(Date.now.timeIntervalSince(start) / duration, 1)
+                routeReveal = 1 - pow(1 - t, 3)   // ease-out cubic
+                if t >= 1 { break }
+                try? await Task.sleep(for: .milliseconds(16))
+            }
+        }
     }
 
     // MARK: Camera

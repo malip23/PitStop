@@ -12,6 +12,7 @@ struct RunStatsCard: View {
     var onPlan: () -> Void = {}
 
     @State private var expanded = false
+    @State private var shareRun: RunRecord?
 
     var body: some View {
         Group {
@@ -227,14 +228,23 @@ struct RunStatsCard: View {
             .controlSize(.large)
             .sensoryFeedback(.impact, trigger: app.run.state)
         case .finished:
-            Button {
-                expanded = false
-                app.resetRun()
-            } label: {
-                Label("Done", systemImage: "checkmark").frame(maxWidth: .infinity)
+            HStack(spacing: 12) {
+                if let record = app.lastFinishedRun, record.distanceMeters > 20 {
+                    Button { shareRun = record } label: {
+                        Label("Share", systemImage: "square.and.arrow.up").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                }
+                Button {
+                    expanded = false
+                    app.resetRun()
+                } label: {
+                    Label("Done", systemImage: "checkmark").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
             }
-            .buttonStyle(.borderedProminent)
             .controlSize(.large)
+            .sheet(item: $shareRun) { ShareRunSheet(run: $0) }
         case .idle:
             EmptyView()
         }

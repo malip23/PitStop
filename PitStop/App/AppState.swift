@@ -38,6 +38,8 @@ final class AppState {
     /// AI provider. Features talk to it through the `AIService` protocol, so it can be swapped.
     let ai = GeminiService()
     let auth = AuthService()
+    @ObservationIgnored let liveActivity = LiveActivityManager()
+    @ObservationIgnored private var lastActivityStep: String?
     /// Admin/business accounts can preview the runner tabs on one phone (local only; Firestore role unchanged).
     var previewAsRunner = false
 
@@ -167,6 +169,12 @@ final class AppState {
             checkNarration()
             reportQuestETA()
         }
+        if run.state == .running {
+            // A new turn instruction is sent right away; everything else is throttled.
+            let step = navigation.nextStep?.instruction
+            refreshLiveActivity(urgent: step != lastActivityStep)
+            lastActivityStep = step
+        }
         evaluateOffers()
     }
 
@@ -245,6 +253,7 @@ final class AppState {
             return
         }
         guard case .offer(let offer) = popup.content, offerDeadlines[offer.quest.id] == nil else { return }
+        defer { refreshLiveActivity(urgent: true) }   // show the offer + countdown on the Lock Screen
         let id = offer.quest.id
         offerDeadlines[id] = .now.addingTimeInterval(OfferTiming.countdown)
         questStore.recordOffer(.shown, for: id)
@@ -276,6 +285,37 @@ final class AppState {
     private func stopOfferTimer(_ id: Quest.ID) {
         offerTimers[id]?.cancel()
         offerTimers[id] = nil
+        // The offer just closed (accepted, passed, expired, or ended): clear it from the Live Activity.
+        Task { @MainActor in self.refreshLiveActivity(urgent: true) }
+    }
+
+    // MARK: Live Activity
+
+    /// Current run data for the Lock Screen / Dynamic Island.
+    func liveActivityState() -> RunActivityAttributes.ContentState {
+        let elapsed = run.elapsed()
+        let left: Double? = navigation.isNavigating
+            ? navigation.remainingDistance
+            : run.targetDistance.map { max(0, $0 - run.distanceMeters) }
+        var offer: RunActivityAttributes.ContentState.Offer?
+        if let visible = visibleOffer, let deadline = offerDeadlines[visible.quest.id] {
+            offer = .init(businessName: visible.business.name, reward: visible.quest.reward, deadline: deadline)
+        }
+        return .init(timerStart: Date.now.addingTimeInterval(-elapsed),
+                     isPaused: run.state == .paused,
+                     pausedElapsed: elapsed,
+                     distanceText: Format.distance(run.distanceMeters),
+                     paceText: "\(Format.pace(secondsPerMeter: run.currentPace)) \(Format.paceUnit)",
+                     leftText: left.map { Format.distance($0) },
+                     nextInstruction: navigation.isNavigating ? (navigation.nextStep?.instruction ?? "Continue on route") : nil,
+                     nextSymbol: navigation.isNavigating ? (navigation.nextStep?.symbol ?? "arrow.up") : nil,
+                     nextDistanceText: navigation.isNavigating ? Format.shortDistance(navigation.distanceToNextStep) : nil,
+                     offer: offer)
+    }
+
+    func refreshLiveActivity(urgent: Bool = false) {
+        guard run.isActive else { return }
+        liveActivity.update(liveActivityState(), urgent: urgent)
     }
 
     func offerDeadline(for questID: Quest.ID) -> Date? { offerDeadlines[questID] }
@@ -693,6 +733,9 @@ final class AppState {
             }
         }
         location.setBackgroundTracking(true)
+        lastActivityStep = nil
+        liveActivity.start(destinationName: destination?.name, activitySymbol: plan.activity.symbol,
+                           state: liveActivityState())
         // Ask for permissions at the moment they matter: when a run actually starts.
         if location.authorization == .authorizedWhenInUse {
             location.requestAlways()
@@ -703,14 +746,22 @@ final class AppState {
     func pauseRun() {
         run.pause()
         demo.pause()
+        refreshLiveActivity(urgent: true)
     }
 
     func resumeRun() {
         run.resume()
         demo.resume()
+        refreshLiveActivity(urgent: true)
     }
 
     func endRun() {
+        // Leave the final stats on the Lock Screen for a moment.
+        var final = liveActivityState()
+        final.isPaused = true
+        final.offer = nil
+        final.nextInstruction = nil
+        liveActivity.end(finalState: final)
         run.end()
         demo.stop()
         navigation.stop()

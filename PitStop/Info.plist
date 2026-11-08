@@ -10,6 +10,21 @@
 	<string>$(AI_PROXY_HOST)</string>
 	<key>AI_PROXY_TOKEN</key>
 	<string>$(AI_PROXY_TOKEN)</string>
+	<key>NSSupportsLiveActivities</key>
+	<true/>
+	<key>NSSupportsLiveActivitiesFrequentUpdates</key>
+	<true/>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.malipeters.PitStop</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>pitstop</string>
+			</array>
+		</dict>
+	</array>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>location</string>

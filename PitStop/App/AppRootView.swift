@@ -18,6 +18,10 @@ struct AppRootView: View {
         }
         .animation(.easeInOut(duration: 0.25), value: app.auth.state)
         .task { app.auth.start() }
+        // Tapping the Live Activity / Dynamic Island opens pitstop://run → back to the map.
+        .onOpenURL { url in
+            if url.scheme == "pitstop" { app.selectedTab = .run }
+        }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { app.auth.touchLastActive() }
         }

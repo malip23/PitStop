@@ -30,102 +30,108 @@ struct RunMapScreen: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        Map(position: $camera, selection: $selection) {
-            if app.navigation.isNavigating {
-                // Navigating: covered part of the route in lime, what's left in the coral gradient.
-                if app.navigation.remainingCoordinates.count > 1 {
-                    GlowingRoute(coordinates: app.navigation.remainingCoordinates)
-                }
-                if app.navigation.completedCoordinates.count > 1 {
-                    GlowingRoute(coordinates: app.navigation.completedCoordinates,
-                                 colors: Theme.completedGradient, lineWidth: 7)
-                }
-            } else {
-                // Free run: the path covered so far.
-                if app.run.trace.count > 1 {
-                    GlowingRoute(coordinates: app.run.trace.map(\.coordinate),
-                                 colors: Theme.completedGradient, lineWidth: 6)
-                }
-                // Before the run: every route option, with the selected one highlighted.
-                ForEach(app.routeOptions.filter { $0.id != app.selectedRoute?.id }) { option in
-                    MapPolyline(coordinates: option.coordinates)
-                        .stroke(Theme.coral.opacity(0.35), style: StrokeStyle(lineWidth: 5, lineCap: .round, lineJoin: .round))
-                }
-                if let selected = app.selectedRoute {
-                    // The selected route "draws itself" from start to destination.
-                    let drawn = selected.coordinates.prefix(fraction: routeReveal)
-                    if drawn.count > 1 {
-                        GlowingRoute(coordinates: drawn)
+        // MapReader converts screen taps to coordinates, so route lines can be tapped (see selectRoute(near:)).
+        MapReader { proxy in
+            Map(position: $camera, selection: $selection) {
+                if app.navigation.isNavigating {
+                    // Navigating: covered part of the route in lime, what's left in the coral gradient.
+                    if app.navigation.remainingCoordinates.count > 1 {
+                        GlowingRoute(coordinates: app.navigation.remainingCoordinates)
                     }
-                    if routeReveal < 1, let head = drawn.last {
-                        Annotation("", coordinate: head) {
-                            Circle()
-                                .fill(Theme.coral)
-                                .frame(width: 12, height: 12)
-                                .overlay(Circle().stroke(.white, lineWidth: 2.5))
-                                .shadow(color: Theme.coral.opacity(0.8), radius: 6)
+                    if app.navigation.completedCoordinates.count > 1 {
+                        GlowingRoute(coordinates: app.navigation.completedCoordinates,
+                                     colors: Theme.completedGradient, lineWidth: 7)
+                    }
+                } else {
+                    // Free run: the path covered so far.
+                    if app.run.trace.count > 1 {
+                        GlowingRoute(coordinates: app.run.trace.map(\.coordinate),
+                                     colors: Theme.completedGradient, lineWidth: 6)
+                    }
+                    // Before the run: every route option, with the selected one highlighted.
+                    ForEach(app.routeOptions.filter { $0.id != app.selectedRoute?.id }) { option in
+                        MapPolyline(coordinates: option.coordinates)
+                            .stroke(Theme.coral.opacity(0.35), style: StrokeStyle(lineWidth: 5, lineCap: .round, lineJoin: .round))
+                    }
+                    if let selected = app.selectedRoute {
+                        // The selected route "draws itself" from start to destination.
+                        let drawn = selected.coordinates.prefix(fraction: routeReveal)
+                        if drawn.count > 1 {
+                            GlowingRoute(coordinates: drawn)
+                        }
+                        if routeReveal < 1, let head = drawn.last {
+                            Annotation("", coordinate: head) {
+                                Circle()
+                                    .fill(Theme.coral)
+                                    .frame(width: 12, height: 12)
+                                    .overlay(Circle().stroke(.white, lineWidth: 2.5))
+                                    .shadow(color: Theme.coral.opacity(0.8), radius: 6)
+                            }
+                            .annotationTitles(.hidden)
+                        }
+                    } else if let destination = app.destination, let here = app.currentLocation {
+                        // While routes load: a dashed line toward the destination.
+                        MapPolyline(coordinates: [here.coordinate, destination.coordinate])
+                            .stroke(Theme.coral.opacity(0.8),
+                                    style: StrokeStyle(lineWidth: 3.5, lineCap: .round, dash: [6, 8]))
+                    }
+                }
+
+                // Real places first so partner pins draw on top of them.
+                ForEach(app.places.places) { place in
+                    Annotation(place.name, coordinate: place.coordinate) {
+                        RealPlacePin(place: place, status: app.pinStatus(for: place, selected: selection == .place(place.id)))
+                    }
+                    .tag(MapSelection.place(place.id))
+                    .annotationTitles(.hidden)
+                }
+
+                // Goal-matched places from ring searches that aren't in the nearby cache.
+                ForEach(extraMatchPlaces) { place in
+                    Annotation(place.name, coordinate: place.coordinate) {
+                        RealPlacePin(place: place, status: app.pinStatus(for: place, selected: selection == .place(place.id)))
+                    }
+                    .tag(MapSelection.place(place.id))
+                    .annotationTitles(.hidden)
+                }
+
+                ForEach(app.partners) { business in
+                    Annotation(business.name, coordinate: business.coordinate, anchor: .bottom) {
+                        BusinessPin(business: business,
+                                    status: app.pinStatus(for: business, selected: selection == .partner(business.id)))
+                    }
+                    .tag(MapSelection.partner(business.id))
+                }
+
+                // Destination that isn't one of the pins above (e.g. its place dropped out of the search cache).
+                if let destination = app.destination, !destinationHasPin(destination) {
+                    Annotation("Destination", coordinate: destination.coordinate, anchor: .bottom) {
+                        DestinationFlag()
+                    }
+                    .annotationTitles(.hidden)
+                }
+
+                // Upcoming crosswalks, signals, and intersections (next 300 m) while navigating.
+                if app.navigation.isNavigating && app.preferences.crossingAlerts {
+                    ForEach(app.crossings.upcomingPoints) { point in
+                        Annotation(point.kind.title, coordinate: point.coordinate) {
+                            CrossingMarker(point: point, isActive: app.crossings.activeAlert?.id == point.id)
                         }
                         .annotationTitles(.hidden)
                     }
-                } else if let destination = app.destination, let here = app.currentLocation {
-                    // While routes load: a dashed line toward the destination.
-                    MapPolyline(coordinates: [here.coordinate, destination.coordinate])
-                        .stroke(Theme.coral.opacity(0.8),
-                                style: StrokeStyle(lineWidth: 3.5, lineCap: .round, dash: [6, 8]))
                 }
-            }
 
-            // Real places first so partner pins draw on top of them.
-            ForEach(app.places.places) { place in
-                Annotation(place.name, coordinate: place.coordinate) {
-                    RealPlacePin(place: place, status: app.pinStatus(for: place, selected: selection == .place(place.id)))
-                }
-                .tag(MapSelection.place(place.id))
-                .annotationTitles(.hidden)
-            }
-
-            // Goal-matched places from ring searches that aren't in the nearby cache.
-            ForEach(extraMatchPlaces) { place in
-                Annotation(place.name, coordinate: place.coordinate) {
-                    RealPlacePin(place: place, status: app.pinStatus(for: place, selected: selection == .place(place.id)))
-                }
-                .tag(MapSelection.place(place.id))
-                .annotationTitles(.hidden)
-            }
-
-            ForEach(app.partners) { business in
-                Annotation(business.name, coordinate: business.coordinate, anchor: .bottom) {
-                    BusinessPin(business: business,
-                                status: app.pinStatus(for: business, selected: selection == .partner(business.id)))
-                }
-                .tag(MapSelection.partner(business.id))
-            }
-
-            // Destination that isn't one of the pins above (e.g. its place dropped out of the search cache).
-            if let destination = app.destination, !destinationHasPin(destination) {
-                Annotation("Destination", coordinate: destination.coordinate, anchor: .bottom) {
-                    DestinationFlag()
-                }
-                .annotationTitles(.hidden)
-            }
-
-            // Upcoming crosswalks, signals, and intersections (next 300 m) while navigating.
-            if app.navigation.isNavigating && app.preferences.crossingAlerts {
-                ForEach(app.crossings.upcomingPoints) { point in
-                    Annotation(point.kind.title, coordinate: point.coordinate) {
-                        CrossingMarker(point: point, isActive: app.crossings.activeAlert?.id == point.id)
+                // Custom "you" marker with heading arrow. Uses the app's location, so Demo Mode moves it too.
+                if let here = app.currentLocation {
+                    Annotation("You", coordinate: here.coordinate) {
+                        UserLocationMarker(heading: app.userHeading, mapHeading: lastCamera?.heading ?? 0)
                     }
                     .annotationTitles(.hidden)
                 }
             }
-
-            // Custom "you" marker with heading arrow. Uses the app's location, so Demo Mode moves it too.
-            if let here = app.currentLocation {
-                Annotation("You", coordinate: here.coordinate) {
-                    UserLocationMarker(heading: app.userHeading, mapHeading: lastCamera?.heading ?? 0)
-                }
-                .annotationTitles(.hidden)
-            }
+            .simultaneousGesture(SpatialTapGesture(coordinateSpace: .local).onEnded { tap in
+                selectRoute(near: tap.location, proxy: proxy)
+            })
         }
         .background(GeometryReader { geo in
             Color.clear.onAppear { mapHeight = geo.size.height }
@@ -269,6 +275,31 @@ struct RunMapScreen: View {
         var seen = Set(app.places.places.map(\.id))
         return (app.finder.matches.compactMap(\.realPlace) + app.recommendations.items.compactMap(\.realPlace))
             .filter { seen.insert($0.id).inserted }
+    }
+
+    // MARK: Tapping a route line
+
+    /// SwiftUI map polylines aren't tappable, so: convert the tap to a coordinate, find the nearest
+    /// unselected route option, and select it if it's within ~24 points of the finger (measured on
+    /// screen, so it works at any zoom level). Pins keep their own tap handling.
+    private func selectRoute(near point: CGPoint, proxy: MapProxy) {
+        guard !app.run.isActive, app.routeOptions.count > 1,
+              let tap = proxy.convert(point, from: .local),
+              let edge = proxy.convert(CGPoint(x: point.x + 24, y: point.y), from: .local) else { return }
+        let threshold = tap.distance(to: edge)
+
+        var best: (id: RouteOption.ID, distance: Double)?
+        for option in app.routeOptions where option.id != app.selectedRoute?.id {
+            let coords = option.coordinates
+            for i in 0..<max(coords.count - 1, 0) {
+                let (d, _) = NavigationEngine.distance(from: tap, toSegment: coords[i], coords[i + 1])
+                if d <= threshold, d < (best?.distance ?? .infinity) { best = (option.id, d) }
+            }
+        }
+        guard let best else { return }
+        app.selectRoute(best.id)
+        app.showAISuggestion = false   // show the chips, so the newly picked route is highlighted there
+        Haptics.tap()
     }
 
     // MARK: Route drawing animation
